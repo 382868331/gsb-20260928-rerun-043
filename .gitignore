@@ -6,3 +6,8 @@ __pycache__/
 .env.*
 *.pem
 *.key
+
+# Local study data: private identity mappings and raw imports must never be shared.
+.crp-private/
+# De-identified exports may contain study data; keep generated output out of VCS by default.
+exports/

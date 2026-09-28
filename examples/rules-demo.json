@@ -1,0 +1,61 @@
+{
+  "sensitive_terms": [
+    "张伟国",
+    "李慧敏",
+    "王秀英",
+    "赵德海",
+    "陈建华",
+    "刘桂芳",
+    "心内二科",
+    "阳光小区3号楼",
+    "人民路128号",
+    "幸福里7栋2单元501"
+  ],
+  "tables": {
+    "demographics": {
+      "subject_field": "subject_id",
+      "fields": {
+        "subject_id": "subject_id",
+        "name": "drop",
+        "id_card": "drop",
+        "phone": "drop",
+        "birth_date": "date",
+        "sex": "keep",
+        "address_text": "text"
+      }
+    },
+    "visits": {
+      "subject_field": "subject_id",
+      "fields": {
+        "visit_id": "keep",
+        "subject_id": "subject_id",
+        "visit_date": "date",
+        "department": "text",
+        "notes": "text"
+      }
+    },
+    "labs": {
+      "subject_field": "subject_id",
+      "fields": {
+        "lab_id": "keep",
+        "subject_id": "subject_id",
+        "visit_id": "keep",
+        "sample_date": "date",
+        "item": "keep",
+        "value": "keep",
+        "remark": "text"
+      }
+    },
+    "medications": {
+      "subject_field": "subject_id",
+      "fields": {
+        "med_id": "keep",
+        "subject_id": "subject_id",
+        "visit_id": "keep",
+        "start_date": "date",
+        "drug": "keep",
+        "dose": "keep"
+      }
+    }
+  }
+}
