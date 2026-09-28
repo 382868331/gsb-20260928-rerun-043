@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clinical-research-platform"
+version = "0.1.0"
+description = "临床研究数据平台：虚构资料管理与去标识导出（第一版）"
+requires-python = ">=3.10"
+
+[project.scripts]
+crp = "crp.cli:main"
+
+[tool.setuptools]
+packages = ["crp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

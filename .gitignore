@@ -6,3 +6,6 @@ __pycache__/
 .env.*
 *.pem
 *.key
+data/private/
+data/exports/
+data/batches/

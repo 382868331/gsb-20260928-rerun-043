@@ -1,0 +1,6 @@
+subject_id,visit_id,test_code,collected_at,value,unit,remark
+PT001,V001,LDL,2024-01-08,3.6,mmol/L,空腹采血
+PT001,V002,LDL,2024-03-12,2.9,mmol/L,
+PT002,V001,HBA1C,2024-01-10,7.4,%,联系邮箱 lina.example@example.com
+PT003,V001,WBC,2024-02-02,9.8,10^9/L,
+PT003,V002,WBC,2024-04-18,7.1,10^9/L,
