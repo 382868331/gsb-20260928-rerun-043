@@ -40,15 +40,25 @@ python -m crp update-rules STUDY-001 --rules configs/study001_rules_v2.json \
     --note 'v2：删除人口学备注并补充用药日期平移'
 python -m crp export STUDY-001 --note 'v2：删除人口学备注并补充用药日期平移'
 python -m crp versions STUDY-001
+
+# 比较两次导出：区分规则变化、原始数据变化与最终内容变化
+python -m crp compare STUDY-001 1 2
 ```
 
 默认数据根目录为 `./data`，可用全局参数 `--data-root` 修改。
 
 ## 版本与核对
 
-- 规则或原始数据未变时重复导出是幂等的：复用原版本，并用 SHA-256 校验已发布文件未被改动；
-- 规则变更后产生新版本目录 `exports/<batch>/v00N/`，内含 CSV 与 `manifest.json`（版本说明、
-  规则/数据/输出指纹、文件校验值）；旧版本目录与说明永不覆盖；
+- 幂等复用要求**生效字段规则与原始输入的指纹都一致**，并用 SHA-256 校验已发布文件未被改动。
+  只凭输出字节判定会把"规则改了但对当前数据恰好无影响"的执行错误并入旧版本，造成规则
+  版本溯源错配；
+- 规则或输入变化后必定产生新版本目录 `exports/<batch>/v00N/`，内含 CSV 与 `manifest.json`
+  （版本说明、规则/数据/输出指纹、文件校验值）。即使输出字节与旧版本完全相同也不合并执行
+  身份：新版本仍独立留痕，并在 `content_derived_from` 中记录内容可复用的来源版本；旧版本
+  目录与说明永不覆盖；
+- `compare` 对任意两次版本给出 `rules_changed` / `source_changed` / `output_changed`
+  三类变化判定及逐表 added/removed/changed/unchanged 明细。规则变化不一定改变最终内容，
+  数据变化亦然（例如规则调整未命中任何记录）；
 - `verify` 检查直接标识列、真实受试者号、人工敏感片段、敏感模式，并列出跨表关联到同一伪名的记录。
 
 ## 路线图

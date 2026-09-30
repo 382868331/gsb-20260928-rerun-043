@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import shutil
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -125,3 +125,130 @@ def test_subject_column_cannot_be_dropped(workspace):
     BatchStore(workspace).create(config)
     with pytest.raises(ValueError, match="受试者关联列"):
         Exporter(workspace).export_batch(BATCH)
+
+
+def _rules_v1():
+    return read_json(ROOT / "configs" / "study001.json")["rules"]
+
+
+def test_rule_change_with_identical_bytes_still_gets_new_identity(workspace, exporter):
+    """规则调整未触发任何替换/字节差异时，也必须以新规则版本记录独立导出身份。"""
+    first = exporter.export_batch(BATCH, note="v1：基线规则")
+    v1_bytes = {p.name: p.read_bytes() for p in first.version_dir.iterdir() if p.suffix == ".csv"}
+
+    noop_rules = _rules_v1()
+    noop_rules["demographics"].append({"field": "sex", "action": "keep"})
+    BatchStore(workspace).update_rules(BATCH, noop_rules, note="v2：显式保留 sex（不改变输出）")
+    second = exporter.export_batch(BATCH, note="v2：显式保留 sex（不改变输出）")
+
+    assert second.reused is False
+    assert second.version == first.version + 1
+    assert second.rules_version == 2
+    assert second.content_reused_from == first.version
+
+    v1_manifest = read_json(first.version_dir / "manifest.json")
+    v2_manifest = read_json(second.version_dir / "manifest.json")
+    assert v2_manifest["rules_version"] == 2
+    assert v2_manifest["rules_fingerprint"] != v1_manifest["rules_fingerprint"]
+    assert v2_manifest["source_fingerprint"] == v1_manifest["source_fingerprint"]
+    assert v2_manifest["output_fingerprint"] == v1_manifest["output_fingerprint"]
+    assert v2_manifest["content_derived_from"] == first.version
+
+    v2_bytes = {p.name: p.read_bytes() for p in second.version_dir.iterdir() if p.suffix == ".csv"}
+    assert v2_bytes == v1_bytes
+
+    index = read_json(exporter.store.export_index(BATCH))
+    assert [entry["rules_version"] for entry in index["versions"]] == [1, 2]
+
+    comparison = exporter.compare_exports(BATCH, first.version, second.version)
+    assert comparison.rules_changed is True
+    assert comparison.source_changed is False
+    assert comparison.output_changed is False
+    assert set(comparison.table_changes.values()) == {"unchanged"}
+
+
+def test_compare_distinguishes_date_shift_rule_change(workspace, exporter):
+    """新增用药日期平移规则：规则与最终内容变化，但输入数据未变。"""
+    first = exporter.export_batch(BATCH, note="v1：用药日期不平移")
+    BatchStore(workspace).update_rules(
+        BATCH, read_json(ROOT / "configs" / "study001_rules_v2.json"),
+        note="v2：删除人口学备注并补充用药日期平移",
+    )
+    second = exporter.export_batch(BATCH, note="v2：删除人口学备注并补充用药日期平移")
+
+    comparison = exporter.compare_exports(BATCH, first.version, second.version)
+    assert comparison.rules_changed is True
+    assert comparison.source_changed is False
+    assert comparison.output_changed is True
+    assert comparison.table_changes["visits"] == "unchanged"
+    assert comparison.table_changes["labs"] == "unchanged"
+    assert comparison.table_changes["medications"] == "changed"
+    assert comparison.table_changes["demographics"] == "changed"
+
+    meds = _table(second, "medications")
+    mapping = read_json(exporter.store.private_dir(BATCH) / "mapping.json")
+    offset = mapping["offset_days"]["PT001"]
+    assert meds[0]["start_date"] != "2024-01-09"
+    assert meds[0]["start_date"] == (date(2024, 1, 9) + timedelta(days=offset)).isoformat()
+
+
+def test_partial_record_addition_creates_new_version_keeps_old_provenance(workspace, exporter):
+    """部分记录新增：数据与输出变化但规则不变；旧伪名映射、旧版本说明继续可查。"""
+    first = exporter.export_batch(BATCH, note="v1：首批记录")
+    old_mapping = read_json(exporter.store.private_dir(BATCH) / "mapping.json")
+    old_manifest = read_json(first.version_dir / "manifest.json")
+
+    labs_path = workspace.raw_dir(BATCH) / "labs.csv"
+    with labs_path.open("a", encoding="utf-8", newline="") as fh:
+        fh.write("PT004,V001,HBA1C,2024-03-01,6.5,%,新入组受试者首次采血\n")
+
+    second = exporter.export_batch(BATCH, note="v2：新增 PT004 检验记录")
+    assert second.reused is False
+    assert second.rules_version == 1
+
+    comparison = exporter.compare_exports(BATCH, first.version, second.version)
+    assert comparison.rules_changed is False
+    assert comparison.source_changed is True
+    assert comparison.output_changed is True
+    assert comparison.table_changes["labs"] == "changed"
+    assert comparison.table_changes["demographics"] == "unchanged"
+
+    # 旧映射继续可查且既有受试者伪名不被新数据改写
+    mapping = read_json(exporter.store.private_dir(BATCH) / "mapping.json")
+    for real_id, pseudo in old_mapping["pseudonyms"].items():
+        assert mapping["pseudonyms"][real_id] == pseudo
+    assert "PT004" in mapping["pseudonyms"]
+
+    # 旧版本与旧说明原样保留
+    assert read_json(first.version_dir / "manifest.json") == old_manifest
+    index = read_json(exporter.store.export_index(BATCH))
+    assert [entry["note"] for entry in index["versions"]] == [
+        "v1：首批记录", "v2：新增 PT004 检验记录",
+    ]
+
+    # 公开资料（含新版本）不得带出私有身份映射
+    for version in (first.version, second.version):
+        version_dir = exporter.store.version_dir(BATCH, version)
+        public_files = {p.name for p in version_dir.rglob("*") if p.is_file()}
+        assert "mapping.json" not in public_files
+        public_text = " ".join(
+            p.read_text(encoding="utf-8") for p in version_dir.rglob("*.csv")
+        )
+        for real_id in mapping["pseudonyms"]:
+            assert real_id not in public_text
+    assert scan_leaks(exporter.store, BATCH, second.version) == []
+
+
+def test_repeated_export_with_changed_rules_does_not_merge_into_old_version(workspace, exporter):
+    """规则变化后即使输出指纹相同，重复执行也不能返回旧规则版本。"""
+    first = exporter.export_batch(BATCH, note="v1：基线")
+    noop_rules = _rules_v1()
+    noop_rules["visits"].append({"field": "visit_type", "action": "keep"})
+    BatchStore(workspace).update_rules(BATCH, noop_rules, note="v2：文档化 visit_type 保留")
+
+    second = exporter.export_batch(BATCH, note="v2：文档化 visit_type 保留")
+    third = exporter.export_batch(BATCH, note="v2 再次导出仍指向新身份")
+    assert third.reused is True
+    assert third.version == second.version
+    assert third.rules_version == 2
+    assert third.version != first.version

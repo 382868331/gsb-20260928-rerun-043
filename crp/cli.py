@@ -33,6 +33,22 @@ def cmd_export(args: argparse.Namespace) -> None:
     action = "复用既有" if result.reused else "生成新"
     print(f"{action}导出版本 v{result.version:03d}：{result.version_dir}")
     print(f"依据字段规则 v{result.rules_version}；版本说明：{result.note}")
+    if not result.reused and result.content_reused_from is not None:
+        print(
+            f"输出内容与 v{result.content_reused_from:03d} 字节相同，"
+            f"但生效规则/输入不同，已单独记录本次执行身份 v{result.version:03d}"
+        )
+
+
+def cmd_compare(args: argparse.Namespace) -> None:
+    comparison = Exporter(_store(args)).compare_exports(
+        args.batch_id, args.left_version, args.right_version
+    )
+    print(
+        f"v{args.left_version:03d} -> v{args.right_version:03d}：{comparison.describe()}"
+    )
+    for table, status in comparison.table_changes.items():
+        print(f"  {table}: {status}")
 
 
 def cmd_verify(args: argparse.Namespace) -> None:
@@ -82,6 +98,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("batch_id")
     p.add_argument("--version", type=int, default=None)
     p.set_defaults(func=cmd_verify)
+    p = sub.add_parser("compare", help="比较两次导出：规则/数据/最终内容变化")
+    p.add_argument("batch_id")
+    p.add_argument("left_version", type=int)
+    p.add_argument("right_version", type=int)
+    p.set_defaults(func=cmd_compare)
     p = sub.add_parser("versions", help="列出导出版本及说明")
     p.add_argument("batch_id")
     p.set_defaults(func=cmd_versions)
