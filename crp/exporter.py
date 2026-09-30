@@ -17,6 +17,7 @@ private/ 目录，绝不写入版本目录。每次导出都会做泄露自检�
 from __future__ import annotations
 
 import csv
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,6 +65,9 @@ class VersionComparison:
     rules_changed: bool
     source_changed: bool
     output_changed: bool
+    rules_config_equal: bool
+    output_equal: bool
+    same_execution: bool
     rules_version_from: int
     rules_version_to: int
     rules_fingerprint_from: str
@@ -84,6 +88,9 @@ class VersionComparison:
             "rules_changed": self.rules_changed,
             "source_changed": self.source_changed,
             "output_changed": self.output_changed,
+            "rules_config_equal": self.rules_config_equal,
+            "output_equal": self.output_equal,
+            "same_execution": self.same_execution,
             "rules_version": {"from": self.rules_version_from, "to": self.rules_version_to},
             "rules_fingerprint": {
                 "from": self.rules_fingerprint_from,
@@ -190,22 +197,46 @@ class Exporter:
         tables = self.transform(batch)
         rules_fp, source_fp, output_fp = self.calculate_fingerprints(batch, tables)
         index = self._load_index(batch_id)
-        # 只有真正生效的规则与输入都相同，才允许复用同一执行身份。
+        # 执行身份由「真正生效的规则修订号 + 输入指纹」唯一确定：
+        # 规则退回旧配置时配置指纹虽然相同，但修订号已前进，必须产生新执行。
         for entry in index["versions"]:
             if (
-                entry["rules_fingerprint"] == rules_fp
+                int(entry["rules_version"]) == batch.rules_version
                 and entry["source_fingerprint"] == source_fp
-                and entry["output_fingerprint"] == output_fp
             ):
                 version = int(entry["version"])
                 version_dir = self.store.version_dir(batch_id, version)
                 self._verify_checksums(version_dir, entry["files"])
+                if entry["output_fingerprint"] != output_fp:
+                    raise RuntimeError(
+                        f"同一次执行重跑结果不一致: v{version:03d} 输出指纹发生变化"
+                    )
                 return ExportResult(batch_id, version, version_dir, True,
                                     int(entry["rules_version"]), entry["note"])
 
-        version = int(index.get("latest", 0)) + 1
+        existing = [
+            int(path.name[1:])
+            for path in self.store.export_dir(batch_id).glob("v[0-9][0-9][0-9]")
+        ]
+        version = max(existing + [int(entry["version"]) for entry in index["versions"]], default=0) + 1
         version_dir = self.store.version_dir(batch_id, version)
         version_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            content_reused_from = self._commit_version(
+                batch, tables, version, version_dir, index,
+                rules_fp, source_fp, output_fp, note,
+            )
+        except BaseException:
+            # 中断/自检失败后清掉不完整目录，下次重试得到干净的新版本号，旧执行不受影响。
+            shutil.rmtree(version_dir, ignore_errors=True)
+            raise
+        return ExportResult(batch_id, version, version_dir, False, batch.rules_version,
+                            note or f"字段规则 v{batch.rules_version} 导出", content_reused_from)
+
+    def _commit_version(
+        self, batch: Batch, tables: list[TableExport], version: int, version_dir: Path,
+        index: dict[str, Any], rules_fp: str, source_fp: str, output_fp: str, note: str,
+    ) -> int | None:
         files: dict[str, str] = {}
         for exported in tables:
             target = version_dir / f"{exported.table}.csv"
@@ -214,13 +245,14 @@ class Exporter:
         # 规则/输入已变，但最终字节可能恰好与旧版本一致：记录内容来源而非合并执行身份。
         content_reused_from = self._match_output_version(index, output_fp)
         if content_reused_from is not None:
-            self._verify_reused_content(batch_id, content_reused_from, files)
+            self._verify_reused_content(index, batch.batch_id, content_reused_from, files)
+        manifest_note = note or f"字段规则 v{batch.rules_version} 导出"
         manifest = {
-            "batch_id": batch_id,
+            "batch_id": batch.batch_id,
             "version": version,
             "created_at": _now(),
             "rules_version": batch.rules_version,
-            "note": note or f"字段规则 v{batch.rules_version} 导出",
+            "note": manifest_note,
             "subject_field": batch.subject_field,
             "tables": batch.tables,
             "rules_fingerprint": rules_fp,
@@ -231,6 +263,9 @@ class Exporter:
             "files": dict(sorted(files.items())),
         }
         write_json(version_dir / "manifest.json", manifest)
+        findings = scan_leaks(self.store, batch.batch_id, version)
+        if findings:
+            raise RuntimeError("导出结果泄露自检失败: " + "; ".join(findings))
         final_files = {
             name: sha256_file(version_dir / name)
             for name in sorted(list(files) + ["manifest.json"])
@@ -243,25 +278,74 @@ class Exporter:
             "source_fingerprint": source_fp,
             "output_fingerprint": output_fp,
             "content_reused_from": content_reused_from,
-            "note": manifest["note"],
+            "note": manifest_note,
             "dir": version_dir.name,
             "files": final_files,
         }
-        index["batch_id"] = batch_id
+        index["batch_id"] = batch.batch_id
         index["latest"] = version
         index["versions"].append(entry)
-        write_json(self.store.export_index(batch_id), index)
-        findings = scan_leaks(self.store, batch_id, version)
-        if findings:
-            raise RuntimeError("导出结果泄露自检失败: " + "; ".join(findings))
-        return ExportResult(batch_id, version, version_dir, False, batch.rules_version,
-                            manifest["note"], content_reused_from)
+        write_json(self.store.export_index(batch.batch_id), index)
+        return content_reused_from
 
     def _load_index(self, batch_id: str) -> dict[str, Any]:
         path = self.store.export_index(batch_id)
-        if path.exists():
-            return read_json(path)
-        return {"batch_id": batch_id, "latest": 0, "versions": []}
+        index = read_json(path) if path.exists() else {
+            "batch_id": batch_id, "latest": 0, "versions": [],
+        }
+        entries = {int(entry["version"]): entry for entry in index.get("versions", [])}
+        changed = False
+        export_root = self.store.export_dir(batch_id)
+        if export_root.exists():
+            for version_dir in sorted(export_root.glob("v[0-9][0-9][0-9]")):
+                version_number = int(version_dir.name[1:])
+                manifest_path = version_dir / "manifest.json"
+                entry = entries.get(version_number)
+                if entry is None and not manifest_path.exists():
+                    # 无 manifest 的目录只能是中断残留，删除后本次可重用该版本号重试。
+                    shutil.rmtree(version_dir, ignore_errors=True)
+                    changed = True
+                    continue
+                if entry is None and manifest_path.exists():
+                    # 迁移历史记录（index.json 缺失/不全）：从不可变版本目录重建索引。
+                    entries[version_number] = self._entry_from_manifest(version_number, manifest_path)
+                    changed = True
+                    continue
+                if entry is not None:
+                    present = {
+                        p.name: sha256_file(p)
+                        for p in version_dir.iterdir() if p.is_file()
+                    }
+                    if entry.get("files") != present or not manifest_path.exists():
+                        # 目录不完整（中断残留/文件被删改）：不计入有效执行；无 manifest 则无法恢复，删除。
+                        del entries[version_number]
+                        changed = True
+                        if not manifest_path.exists():
+                            shutil.rmtree(version_dir, ignore_errors=True)
+        ordered = [entries[key] for key in sorted(entries)]
+        latest = max(entries, default=0)
+        if changed or list(index.get("versions", [])) != ordered or int(index.get("latest", 0)) != latest:
+            index = {"batch_id": batch_id, "latest": latest, "versions": ordered}
+            write_json(path, index)
+        return index
+
+    def _entry_from_manifest(self, version: int, manifest_path: Path) -> dict[str, Any]:
+        manifest = read_json(manifest_path)
+        version_dir = manifest_path.parent
+        return {
+            "version": version,
+            "created_at": manifest["created_at"],
+            "rules_version": int(manifest["rules_version"]),
+            "rules_fingerprint": manifest["rules_fingerprint"],
+            "source_fingerprint": manifest["source_fingerprint"],
+            "output_fingerprint": manifest["output_fingerprint"],
+            "content_reused_from": manifest.get("content_reused_from"),
+            "note": manifest["note"],
+            "dir": version_dir.name,
+            "files": {
+                p.name: sha256_file(p) for p in sorted(version_dir.iterdir()) if p.is_file()
+            },
+        }
 
     def _verify_checksums(self, version_dir: Path, files: dict[str, str]) -> None:
         for name, expected in files.items():
@@ -277,13 +361,13 @@ class Exporter:
         return None
 
     def _verify_reused_content(
-        self, batch_id: str, source_version: int, files: dict[str, str]
+        self, index: dict[str, Any], batch_id: str, source_version: int,
+        files: dict[str, str],
     ) -> None:
         """确认本次新写入的 CSV 与被引用版本逐文件字节一致。"""
         source_dir = self.store.version_dir(batch_id, source_version)
-        source_index = self._load_index(batch_id)
         source_entry = next(
-            entry for entry in source_index["versions"] if int(entry["version"]) == source_version
+            entry for entry in index["versions"] if int(entry["version"]) == source_version
         )
         for name, expected in files.items():
             actual = sha256_file(source_dir / name)
@@ -322,6 +406,13 @@ class Exporter:
             rules_changed=left["rules_fingerprint"] != right["rules_fingerprint"],
             source_changed=left["source_fingerprint"] != right["source_fingerprint"],
             output_changed=left["output_fingerprint"] != right["output_fingerprint"],
+            # 三个层次：配置指纹相同（修订号可以不同）、公开输出字节相同、同一次执行（幂等重跑）。
+            rules_config_equal=left["rules_fingerprint"] == right["rules_fingerprint"],
+            output_equal=left["output_fingerprint"] == right["output_fingerprint"],
+            same_execution=(
+                int(left["rules_version"]) == int(right["rules_version"])
+                and left["source_fingerprint"] == right["source_fingerprint"]
+            ),
             rules_version_from=int(left["rules_version"]),
             rules_version_to=int(right["rules_version"]),
             rules_fingerprint_from=left["rules_fingerprint"],
@@ -334,3 +425,43 @@ class Exporter:
             removed_files=removed,
             changed_files=changed,
         )
+
+    def rule_trail(self, batch_id: str) -> list[dict[str, Any]]:
+        """沿规则修订顺序给出每次执行及其与前一次执行的关系。"""
+        batch = self.batches.load(batch_id)
+        revisions = {
+            int(item["rules_version"]): item for item in batch.history
+        }
+        index = self._load_index(batch_id)
+        trail: list[dict[str, Any]] = []
+        prev: dict[str, Any] | None = None
+        for entry in sorted(index["versions"], key=lambda item: int(item["version"])):
+            revision = revisions.get(int(entry["rules_version"]))
+            reused_from = entry.get("content_reused_from")
+            if reused_from is not None:
+                reused_from = int(reused_from)
+            item = {
+                "version": int(entry["version"]),
+                "rules_version": int(entry["rules_version"]),
+                "rules_note": revision.get("note", "") if revision else "",
+                "rules_config_equal_previous": (
+                    prev is not None and entry["rules_fingerprint"] == prev["rules_fingerprint"]
+                ),
+                "source_equal_previous": (
+                    prev is not None and entry["source_fingerprint"] == prev["source_fingerprint"]
+                ),
+                "output_equal_previous": (
+                    prev is not None and entry["output_fingerprint"] == prev["output_fingerprint"]
+                ),
+                "same_execution_as_previous": (
+                    prev is not None
+                    and int(entry["rules_version"]) == int(prev["rules_version"])
+                    and entry["source_fingerprint"] == prev["source_fingerprint"]
+                ),
+                "content_reused_from": reused_from,
+                "note": entry["note"],
+                "created_at": entry["created_at"],
+            }
+            trail.append(item)
+            prev = entry
+        return trail

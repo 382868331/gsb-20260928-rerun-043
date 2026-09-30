@@ -42,7 +42,7 @@ def cmd_export(args: argparse.Namespace) -> None:
 
 def cmd_verify(args: argparse.Namespace) -> None:
     store = _store(args)
-    index = read_json(store.export_index(args.batch_id))
+    index = Exporter(store)._load_index(args.batch_id)
     version = args.version if args.version is not None else int(index["latest"])
     findings = scan_leaks(store, args.batch_id, version)
     linked = cross_table_consistency(store, args.batch_id, version)
@@ -57,11 +57,10 @@ def cmd_verify(args: argparse.Namespace) -> None:
 
 def cmd_versions(args: argparse.Namespace) -> None:
     store = _store(args)
-    index_path = store.export_index(args.batch_id)
-    if not index_path.exists():
+    index = Exporter(store)._load_index(args.batch_id)
+    if not index["versions"]:
         print("暂无导出版本")
         return
-    index = read_json(index_path)
     for entry in index["versions"]:
         print(f"v{int(entry['version']):03d} 规则v{entry['rules_version']} {entry['created_at']} {entry['note']}")
 
@@ -82,12 +81,37 @@ def cmd_compare(args: argparse.Namespace) -> None:
     print(
         f"  规则版本: v{comparison.rules_version_from} -> v{comparison.rules_version_to}"
     )
+    print("  配置相同: {}".format("是" if comparison.rules_config_equal else "否"))
+    print("  公开输出相同: {}".format("是" if comparison.output_equal else "否"))
+    print("  属于同一次执行: {}".format("是" if comparison.same_execution else "否"))
     if comparison.added_files:
         print(f"  新增文件: {', '.join(comparison.added_files)}")
     if comparison.removed_files:
         print(f"  删除文件: {', '.join(comparison.removed_files)}")
     if comparison.changed_files:
         print(f"  内容变化文件: {', '.join(comparison.changed_files)}")
+
+
+def cmd_rule_trail(args: argparse.Namespace) -> None:
+    trail = Exporter(_store(args)).rule_trail(args.batch_id)
+    if not trail:
+        print("暂无执行记录")
+        return
+    print(f"批次 {args.batch_id} 沿规则修订顺序的执行记录：")
+    for item in trail:
+        tags: list[str] = []
+        if item["same_execution_as_previous"]:
+            tags.append("同一次执行重跑")
+        elif item["rules_config_equal_previous"]:
+            tags.append("规则配置退回/重复")
+        if item["output_equal_previous"] and not item["same_execution_as_previous"]:
+            tags.append("公开输出与上一版相同")
+        if item["content_reused_from"] is not None:
+            tags.append(f"内容复用自 v{item['content_reused_from']:03d}")
+        tag_text = f"（{'，'.join(tags)}）" if tags else ""
+        print(
+            f"  v{item['version']:03d} 依据规则修订 v{item['rules_version']}：{item['note']}{tag_text}"
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -119,6 +143,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("from_version", type=int)
     p.add_argument("to_version", type=int)
     p.set_defaults(func=cmd_compare)
+    p = sub.add_parser("rule-trail", help="沿规则修订顺序查看每次执行与复用关系")
+    p.add_argument("batch_id")
+    p.set_defaults(func=cmd_rule_trail)
     return parser
 
 

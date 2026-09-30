@@ -220,3 +220,109 @@ def test_partial_record_addition_changes_source_and_output(workspace, exporter):
     mapping = read_json(exporter.store.private_dir(BATCH) / "mapping.json")
     assert set(mapping["pseudonyms"]) >= {"PT001", "PT002", "PT003", "PT004"}
     assert read_json(first.version_dir / "manifest.json")["note"] == "v1：三名受试者"
+
+
+def test_rules_reverted_to_old_config_still_creates_new_execution(workspace, exporter):
+    """v1 -> v2 -> 改回 v1 配置（成为规则修订 v3）：第三次执行不得冒充第一次。"""
+    v1 = exporter.export_batch(BATCH, note="v1 执行")
+    BatchStore(workspace).update_rules(
+        BATCH, read_json(ROOT / "configs" / "study001_rules_v2.json"),
+        note="v2 修订",
+    )
+    v2 = exporter.export_batch(BATCH, note="v2 执行")
+    # 输入资料随后变化（新增 PT004），再把规则退回第一版配置。
+    demographics = workspace.raw_dir(BATCH) / "demographics.csv"
+    with demographics.open("a", encoding="utf-8", newline="") as fh:
+        fh.write("PT004,陈晨,310104200101041234,13000000004,2001-01-04,女,"
+                 "上海市浦东新区世纪大道100号,随访电话13000000004\n")
+    BatchStore(workspace).update_rules(
+        BATCH, read_json(ROOT / "configs" / "study001.json")["rules"],
+        note="v3 修订：退回 v1 配置",
+    )
+    v3 = exporter.export_batch(BATCH, note="v3 执行：旧配置+新来源")
+
+    assert v3.reused is False and v3.version == 3
+    assert v3.version != v1.version
+    v1m = read_json(v1.version_dir / "manifest.json")
+    v3m = read_json(v3.version_dir / "manifest.json")
+    assert v3m["rules_version"] == 3
+    assert v3m["rules_fingerprint"] == v1m["rules_fingerprint"]
+    assert v3m["source_fingerprint"] != v1m["source_fingerprint"]
+    # 新来源必须体现在本次公开结果里。
+    assert len(_table(v3, "demographics")) == 4
+    assert len(_table(v1, "demographics")) == 3
+    # v2 的用药日期平移在退回后不再生效。
+    assert "start_date" in _table(v2, "medications")[0]
+    med_v2 = _table(v2, "medications")[0]
+    med_v3 = _table(v3, "medications")[0]
+    assert med_v3["start_date"] == "2024-01-09"
+    assert med_v2["start_date"] != "2024-01-09"
+    assert med_v3["end_date"] == "2024-03-12"
+    assert "PT004" not in " ".join(
+        p.read_text(encoding="utf-8") for p in v3.version_dir.glob("*.csv")
+    )
+    # 旧执行原样可查。
+    assert v1.version_dir.exists() and v2.version_dir.exists()
+
+    comparison = exporter.compare_versions(BATCH, v1.version, v3.version)
+    assert comparison.rules_config_equal is True
+    assert comparison.rules_changed is False
+    assert comparison.rules_version_from == 1 and comparison.rules_version_to == 3
+    assert comparison.source_changed is True
+    assert comparison.output_equal is False
+    assert comparison.same_execution is False
+
+    trail = exporter.rule_trail(BATCH)
+    assert [item["version"] for item in trail] == [1, 2, 3]
+    assert [item["rules_version"] for item in trail] == [1, 2, 3]
+    assert trail[2]["rules_config_equal_previous"] is False
+    assert trail[2]["source_equal_previous"] is False
+
+
+def test_repeated_export_is_marked_as_same_execution(exporter):
+    first = exporter.export_batch(BATCH, note="首版")
+    second = exporter.export_batch(BATCH, note="重跑")
+    assert second.reused is True and second.version == first.version
+    # 手工构造两次执行记录视角：同规则修订+同输入即同一次执行。
+    index = read_json(exporter.store.export_index(BATCH))
+    assert len(index["versions"]) == 1
+    trail = exporter.rule_trail(BATCH)
+    assert len(trail) == 1
+
+
+def test_interrupted_export_leaves_clean_state_for_retry(workspace, exporter):
+    first = exporter.export_batch(BATCH, note="v1 执行")
+    # 模拟上次导出在写入中途被中断：残留不完整的 v002 目录，index 未登记。
+    orphan = exporter.store.version_dir(BATCH, 2)
+    orphan.mkdir(parents=True)
+    (orphan / "demographics.csv").write_text("partial,data\n", encoding="utf-8")
+    BatchStore(workspace).update_rules(
+        BATCH, read_json(ROOT / "configs" / "study001_rules_v2.json"),
+        note="v2 修订",
+    )
+    second = exporter.export_batch(BATCH, note="v2 执行")
+    assert second.reused is False and second.version == 2
+    assert read_csv(second.version_dir / "demographics.csv")
+    assert first.version_dir.exists()
+    index = read_json(exporter.store.export_index(BATCH))
+    assert [entry["version"] for entry in index["versions"]] == [1, 2]
+
+
+def test_migrated_history_rebuilds_index_from_version_dirs(workspace, exporter):
+    first = exporter.export_batch(BATCH, note="v1 执行")
+    BatchStore(workspace).update_rules(
+        BATCH, read_json(ROOT / "configs" / "study001_rules_v2.json"),
+        note="v2 修订",
+    )
+    second = exporter.export_batch(BATCH, note="v2 执行")
+    # 迁移历史记录：index.json 丢失，只剩不可变版本目录与批次规则历史。
+    exporter.store.export_index(BATCH).unlink()
+    rebuilt = exporter._load_index(BATCH)
+    assert [entry["version"] for entry in rebuilt["versions"]] == [1, 2]
+    assert rebuilt["latest"] == 2
+    assert rebuilt["versions"][0]["rules_version"] == 1
+    assert rebuilt["versions"][1]["rules_version"] == 2
+    # 旧执行仍可查，compare 仍可用。
+    comparison = exporter.compare_versions(BATCH, first.version, second.version)
+    assert comparison.rules_changed is True
+    assert comparison.output_equal is False
