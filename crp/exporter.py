@@ -1,8 +1,17 @@
 """去标识导出与不可变导出版本管理。
 
 导出内容只包含去标识后的 CSV 与 manifest.json；伪名/日期偏移映射保存在独立的
-private/ 目录，绝不写入版本目录。每次导出都会做泄露自检。规则或数据未变时重复导出幂等，
-字段规则更新后生成新版本，旧版本及其说明原样保留。
+private/ 目录，绝不写入版本目录。每次导出都会做泄露自检。
+
+复用规则（区分执行身份与文件内容）：
+- 规则指纹与输入指纹都未变时，重复导出幂等：复用同一执行版本并做字节级核对；
+- 规则或输入任一变化都会产生**新的执行身份**（新版本目录、新 manifest、新版本说明），
+  即使去标识后的最终字节恰好与某个旧版本完全一致，也不得合并为旧版本；
+  此时通过 ``content_reused_from`` 记录内容与哪一版字节相同，溯源仍指向本次真正生效的
+  规则与输入；
+- ``compare_versions`` 比较两次导出，分别报告规则变化、输入数据变化与最终内容变化。
+
+旧版本目录及其说明永不覆盖。
 """
 
 from __future__ import annotations
@@ -42,6 +51,56 @@ class ExportResult:
     reused: bool
     rules_version: int
     note: str
+    content_reused_from: int | None = None
+
+
+@dataclass(frozen=True)
+class VersionComparison:
+    """两次导出之间的影响比较，三类变化互不混淆。"""
+
+    batch_id: str
+    from_version: int
+    to_version: int
+    rules_changed: bool
+    source_changed: bool
+    output_changed: bool
+    rules_version_from: int
+    rules_version_to: int
+    rules_fingerprint_from: str
+    rules_fingerprint_to: str
+    source_fingerprint_from: str
+    source_fingerprint_to: str
+    output_fingerprint_from: str
+    output_fingerprint_to: str
+    added_files: tuple[str, ...]
+    removed_files: tuple[str, ...]
+    changed_files: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "batch_id": self.batch_id,
+            "from_version": self.from_version,
+            "to_version": self.to_version,
+            "rules_changed": self.rules_changed,
+            "source_changed": self.source_changed,
+            "output_changed": self.output_changed,
+            "rules_version": {"from": self.rules_version_from, "to": self.rules_version_to},
+            "rules_fingerprint": {
+                "from": self.rules_fingerprint_from,
+                "to": self.rules_fingerprint_to,
+            },
+            "source_fingerprint": {
+                "from": self.source_fingerprint_from,
+                "to": self.source_fingerprint_to,
+            },
+            "output_fingerprint": {
+                "from": self.output_fingerprint_from,
+                "to": self.output_fingerprint_to,
+            },
+            "added_files": list(self.added_files),
+            "removed_files": list(self.removed_files),
+            "changed_files": list(self.changed_files),
+        }
 
 
 class Exporter:
@@ -131,8 +190,13 @@ class Exporter:
         tables = self.transform(batch)
         rules_fp, source_fp, output_fp = self.calculate_fingerprints(batch, tables)
         index = self._load_index(batch_id)
+        # 只有真正生效的规则与输入都相同，才允许复用同一执行身份。
         for entry in index["versions"]:
-            if entry["output_fingerprint"] == output_fp and entry["source_fingerprint"] == source_fp:
+            if (
+                entry["rules_fingerprint"] == rules_fp
+                and entry["source_fingerprint"] == source_fp
+                and entry["output_fingerprint"] == output_fp
+            ):
                 version = int(entry["version"])
                 version_dir = self.store.version_dir(batch_id, version)
                 self._verify_checksums(version_dir, entry["files"])
@@ -147,6 +211,10 @@ class Exporter:
             target = version_dir / f"{exported.table}.csv"
             write_csv(target, exported.rows, exported.fieldnames)
             files[f"{exported.table}.csv"] = sha256_file(target)
+        # 规则/输入已变，但最终字节可能恰好与旧版本一致：记录内容来源而非合并执行身份。
+        content_reused_from = self._match_output_version(index, output_fp)
+        if content_reused_from is not None:
+            self._verify_reused_content(batch_id, content_reused_from, files)
         manifest = {
             "batch_id": batch_id,
             "version": version,
@@ -158,6 +226,8 @@ class Exporter:
             "rules_fingerprint": rules_fp,
             "source_fingerprint": source_fp,
             "output_fingerprint": output_fp,
+            "content_reused_from": content_reused_from,
+            "reused_content": content_reused_from is not None,
             "files": dict(sorted(files.items())),
         }
         write_json(version_dir / "manifest.json", manifest)
@@ -172,6 +242,7 @@ class Exporter:
             "rules_fingerprint": rules_fp,
             "source_fingerprint": source_fp,
             "output_fingerprint": output_fp,
+            "content_reused_from": content_reused_from,
             "note": manifest["note"],
             "dir": version_dir.name,
             "files": final_files,
@@ -183,7 +254,8 @@ class Exporter:
         findings = scan_leaks(self.store, batch_id, version)
         if findings:
             raise RuntimeError("导出结果泄露自检失败: " + "; ".join(findings))
-        return ExportResult(batch_id, version, version_dir, False, batch.rules_version, manifest["note"])
+        return ExportResult(batch_id, version, version_dir, False, batch.rules_version,
+                            manifest["note"], content_reused_from)
 
     def _load_index(self, batch_id: str) -> dict[str, Any]:
         path = self.store.export_index(batch_id)
@@ -196,3 +268,69 @@ class Exporter:
             actual = sha256_file(version_dir / name)
             if actual != expected:
                 raise RuntimeError(f"重复导出核对失败，已发布版本被改动: {version_dir / name}")
+
+    def _match_output_version(self, index: dict[str, Any], output_fp: str) -> int | None:
+        """在旧版本中找到输出字节完全一致的最近一版（只代表内容相同，不代表身份相同）。"""
+        for entry in reversed(index["versions"]):
+            if entry["output_fingerprint"] == output_fp:
+                return int(entry["version"])
+        return None
+
+    def _verify_reused_content(
+        self, batch_id: str, source_version: int, files: dict[str, str]
+    ) -> None:
+        """确认本次新写入的 CSV 与被引用版本逐文件字节一致。"""
+        source_dir = self.store.version_dir(batch_id, source_version)
+        source_index = self._load_index(batch_id)
+        source_entry = next(
+            entry for entry in source_index["versions"] if int(entry["version"]) == source_version
+        )
+        for name, expected in files.items():
+            actual = sha256_file(source_dir / name)
+            if actual != expected or source_entry["files"].get(name) != expected:
+                raise RuntimeError(
+                    f"内容复用核对失败: v{source_version:03d} 的 {name} 与当前输出不一致"
+                )
+
+    def compare_versions(
+        self, batch_id: str, version_a: int, version_b: int
+    ) -> VersionComparison:
+        """比较两次导出在规则、输入数据、最终内容三个维度上的差异。"""
+        index = self._load_index(batch_id)
+        entries = {int(entry["version"]): entry for entry in index["versions"]}
+        if version_a not in entries:
+            raise ValueError(f"版本不存在: v{version_a:03d}")
+        if version_b not in entries:
+            raise ValueError(f"版本不存在: v{version_b:03d}")
+        left, right = entries[version_a], entries[version_b]
+        left_files = {
+            name: checksum for name, checksum in left["files"].items() if name.endswith(".csv")
+        }
+        right_files = {
+            name: checksum for name, checksum in right["files"].items() if name.endswith(".csv")
+        }
+        added = tuple(sorted(set(right_files) - set(left_files)))
+        removed = tuple(sorted(set(left_files) - set(right_files)))
+        changed = tuple(sorted(
+            name for name in set(left_files) & set(right_files)
+            if left_files[name] != right_files[name]
+        ))
+        return VersionComparison(
+            batch_id=batch_id,
+            from_version=version_a,
+            to_version=version_b,
+            rules_changed=left["rules_fingerprint"] != right["rules_fingerprint"],
+            source_changed=left["source_fingerprint"] != right["source_fingerprint"],
+            output_changed=left["output_fingerprint"] != right["output_fingerprint"],
+            rules_version_from=int(left["rules_version"]),
+            rules_version_to=int(right["rules_version"]),
+            rules_fingerprint_from=left["rules_fingerprint"],
+            rules_fingerprint_to=right["rules_fingerprint"],
+            source_fingerprint_from=left["source_fingerprint"],
+            source_fingerprint_to=right["source_fingerprint"],
+            output_fingerprint_from=left["output_fingerprint"],
+            output_fingerprint_to=right["output_fingerprint"],
+            added_files=added,
+            removed_files=removed,
+            changed_files=changed,
+        )

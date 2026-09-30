@@ -33,6 +33,11 @@ def cmd_export(args: argparse.Namespace) -> None:
     action = "复用既有" if result.reused else "生成新"
     print(f"{action}导出版本 v{result.version:03d}：{result.version_dir}")
     print(f"依据字段规则 v{result.rules_version}；版本说明：{result.note}")
+    if not result.reused and result.content_reused_from is not None:
+        print(
+            f"规则/输入已变化，本次为独立执行版本；最终文件字节与 v{result.content_reused_from:03d} 一致，"
+            "已在 manifest 中记录内容来源"
+        )
 
 
 def cmd_verify(args: argparse.Namespace) -> None:
@@ -61,6 +66,30 @@ def cmd_versions(args: argparse.Namespace) -> None:
         print(f"v{int(entry['version']):03d} 规则v{entry['rules_version']} {entry['created_at']} {entry['note']}")
 
 
+def cmd_compare(args: argparse.Namespace) -> None:
+    comparison = Exporter(_store(args)).compare_versions(
+        args.batch_id, args.from_version, args.to_version
+    )
+    print(f"比较 v{args.from_version:03d} -> v{args.to_version:03d}")
+    labels = (
+        ("规则变化", comparison.rules_changed),
+        ("输入数据变化", comparison.source_changed),
+        ("最终内容变化", comparison.output_changed),
+    )
+    for label, changed in labels:
+        mark = "是" if changed else "否"
+        print(f"  {label}: {mark}")
+    print(
+        f"  规则版本: v{comparison.rules_version_from} -> v{comparison.rules_version_to}"
+    )
+    if comparison.added_files:
+        print(f"  新增文件: {', '.join(comparison.added_files)}")
+    if comparison.removed_files:
+        print(f"  删除文件: {', '.join(comparison.removed_files)}")
+    if comparison.changed_files:
+        print(f"  内容变化文件: {', '.join(comparison.changed_files)}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="crp", description="临床研究数据平台：虚构资料去标识导出")
     parser.add_argument("--data-root", default="data", help="数据根目录（默认 ./data）")
@@ -85,6 +114,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("versions", help="列出导出版本及说明")
     p.add_argument("batch_id")
     p.set_defaults(func=cmd_versions)
+    p = sub.add_parser("compare", help="比较两次导出的规则/数据/内容变化")
+    p.add_argument("batch_id")
+    p.add_argument("from_version", type=int)
+    p.add_argument("to_version", type=int)
+    p.set_defaults(func=cmd_compare)
     return parser
 
 

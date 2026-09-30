@@ -125,3 +125,98 @@ def test_subject_column_cannot_be_dropped(workspace):
     BatchStore(workspace).create(config)
     with pytest.raises(ValueError, match="受试者关联列"):
         Exporter(workspace).export_batch(BATCH)
+
+
+def test_inert_rule_change_keeps_bytes_but_records_new_execution_identity(workspace, exporter):
+    """规则变化但未触发任何替换时，输出字节恰好不变：仍须产生新版本身份。"""
+    first = exporter.export_batch(BATCH, note="v1：基线规则")
+    v1_manifest = read_json(first.version_dir / "manifest.json")
+    v1_bytes = {
+        p.name: p.read_bytes() for p in first.version_dir.glob("*.csv")
+    }
+
+    config = read_json(ROOT / "configs" / "study001.json")
+    # 显式 keep 与默认行为完全等价，不改变任何输出字节，但规则指纹变化。
+    config["rules"]["demographics"].append({"field": "sex", "action": "keep"})
+    BatchStore(workspace).update_rules(BATCH, config["rules"], note="v2：显式声明性别保留")
+    second = exporter.export_batch(BATCH, note="v2：显式声明性别保留")
+
+    assert second.reused is False
+    assert second.version == first.version + 1
+    assert second.rules_version == 2
+    assert second.content_reused_from == first.version
+    v2_manifest = read_json(second.version_dir / "manifest.json")
+    assert v2_manifest["rules_version"] == 2
+    assert v2_manifest["rules_fingerprint"] != v1_manifest["rules_fingerprint"]
+    assert v2_manifest["source_fingerprint"] == v1_manifest["source_fingerprint"]
+    assert v2_manifest["output_fingerprint"] == v1_manifest["output_fingerprint"]
+    assert v2_manifest["content_reused_from"] == first.version
+    v2_bytes = {
+        p.name: p.read_bytes() for p in second.version_dir.glob("*.csv")
+    }
+    assert v2_bytes == v1_bytes
+    # 旧版本、旧说明、旧规则溯源原样可查。
+    assert read_json(first.version_dir / "manifest.json") == v1_manifest
+    index = read_json(exporter.store.export_index(BATCH))
+    assert [entry["rules_version"] for entry in index["versions"]] == [1, 2]
+    assert [entry["note"] for entry in index["versions"]] == ["v1：基线规则", "v2：显式声明性别保留"]
+
+    comparison = exporter.compare_versions(BATCH, first.version, second.version)
+    assert comparison.rules_changed is True
+    assert comparison.source_changed is False
+    assert comparison.output_changed is False
+    assert comparison.changed_files == ()
+
+
+def test_compare_distinguishes_date_shift_rule_change(workspace, exporter):
+    """日期平移规则变化会改变最终内容，但输入数据不变。"""
+    first = exporter.export_batch(BATCH, note="v1：用药日期不平移")
+    BatchStore(workspace).update_rules(
+        BATCH, read_json(ROOT / "configs" / "study001_rules_v2.json"),
+        note="v2：补充用药日期平移",
+    )
+    second = exporter.export_batch(BATCH, note="v2：补充用药日期平移")
+
+    comparison = exporter.compare_versions(BATCH, first.version, second.version)
+    payload = comparison.to_dict()
+    assert comparison.rules_changed is True
+    assert comparison.source_changed is False
+    assert comparison.output_changed is True
+    assert "medications.csv" in comparison.changed_files
+    assert payload["rules_version"] == {"from": 1, "to": 2}
+
+
+def test_partial_record_addition_changes_source_and_output(workspace, exporter):
+    """部分记录新增：规则不变、输入变化、输出变化，新增真实编号不得出现在公开文件。"""
+    first = exporter.export_batch(BATCH, note="v1：三名受试者")
+    demographics = workspace.raw_dir(BATCH) / "demographics.csv"
+    with demographics.open("a", encoding="utf-8", newline="") as fh:
+        fh.write("PT004,陈晨,310104200101041234,13000000004,2001-01-04,女,"
+                 "上海市浦东新区世纪大道100号,健康随访电话13000000004\n")
+
+    second = exporter.export_batch(BATCH, note="v2：新增 PT004 记录")
+    assert second.reused is False and second.content_reused_from is None
+    v1_manifest = read_json(first.version_dir / "manifest.json")
+    v2_manifest = read_json(second.version_dir / "manifest.json")
+    assert v2_manifest["rules_fingerprint"] == v1_manifest["rules_fingerprint"]
+    assert v2_manifest["source_fingerprint"] != v1_manifest["source_fingerprint"]
+    assert v2_manifest["output_fingerprint"] != v1_manifest["output_fingerprint"]
+
+    demo = _table(second, "demographics")
+    assert len(demo) == 4
+    public_text = " ".join(
+        path.read_text(encoding="utf-8") for path in second.version_dir.rglob("*.csv")
+    )
+    assert "PT004" not in public_text
+    assert "13000000004" not in public_text and "310104200101041234" not in public_text
+    assert scan_leaks(exporter.store, BATCH, second.version) == []
+
+    comparison = exporter.compare_versions(BATCH, first.version, second.version)
+    assert comparison.rules_changed is False
+    assert comparison.source_changed is True
+    assert comparison.output_changed is True
+    assert comparison.changed_files == ("demographics.csv",)
+    # 旧映射与旧说明继续可查。
+    mapping = read_json(exporter.store.private_dir(BATCH) / "mapping.json")
+    assert set(mapping["pseudonyms"]) >= {"PT001", "PT002", "PT003", "PT004"}
+    assert read_json(first.version_dir / "manifest.json")["note"] == "v1：三名受试者"
