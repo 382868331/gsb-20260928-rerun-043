@@ -8,6 +8,12 @@ import re
 from crp.paths import Store
 from crp.util import read_csv, read_json
 
+
+def _batch_payload(store: Store, batch_id: str) -> tuple[dict, set[str], set[str]]:
+    batch = read_json(store.batch_file(batch_id))
+    raw_ids, manual_phrases = _manual_payload(store, batch_id)
+    return batch, raw_ids, manual_phrases
+
 FORBIDDEN_EXPORT_NAMES = {"mapping.json", "secret"}
 PATTERN_CHECKS = {
     "cn_id_card": re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)"),
@@ -32,13 +38,43 @@ def _manual_payload(store: Store, batch_id: str) -> tuple[set[str], set[str]]:
 
 
 def scan_leaks(store: Store, batch_id: str, version: int) -> list[str]:
-    batch = read_json(store.batch_file(batch_id))
-    raw_ids, manual_phrases = _manual_payload(store, batch_id)
+    batch, raw_ids, manual_phrases = _batch_payload(store, batch_id)
     dropped: dict[str, set[str]] = {}
     for table, rules in batch.get("rules", {}).items():
         dropped[table] = {rule["field"] for rule in rules if rule.get("action") == "drop"}
     findings: list[str] = []
     version_dir = store.version_dir(batch_id, version)
+    findings.extend(
+        _scan_export_dir(version_dir, dropped, raw_ids, manual_phrases)
+    )
+    return findings
+
+
+def scan_leaks_dir(version_dir, batch: dict) -> list[str]:
+    """对暂存/任意导出目录做泄露自检（供原子提交前使用）。
+
+    真实编号与人工敏感片段直接从原始资料与人工标注文件重新推导，不依赖任何
+    已生成的 private 映射，保证自检在导出过程中同样有效。
+    """
+    raw_ids: set[str] = set()
+    subject_field = batch.get("subject_field", "subject_id")
+    store = Store(version_dir.parents[2])
+    raw_dir = store.raw_dir(batch["batch_id"])
+    for table in batch["tables"]:
+        for row in read_csv(raw_dir / f"{table}.csv"):
+            sid = row.get(subject_field, "").strip()
+            if sid:
+                raw_ids.add(sid)
+    _, manual_phrases = _manual_payload(store, batch["batch_id"])
+    dropped = {
+        table: {rule["field"] for rule in rules if rule.get("action") == "drop"}
+        for table, rules in batch.get("rules", {}).items()
+    }
+    return _scan_export_dir(version_dir, dropped, raw_ids, manual_phrases)
+
+
+def _scan_export_dir(version_dir, dropped, raw_ids, manual_phrases) -> list[str]:
+    findings: list[str] = []
     for path in sorted(version_dir.rglob("*")):
         if not path.is_file():
             continue

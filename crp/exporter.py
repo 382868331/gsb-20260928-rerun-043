@@ -17,12 +17,13 @@ private/ 目录，绝不写入版本目录。每次导出都会做泄露自检�
 from __future__ import annotations
 
 import csv
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from crp.audit import scan_leaks
+from crp.audit import scan_leaks_dir
 from crp.batch import Batch, BatchStore
 from crp.dates import shift_date
 from crp.paths import Store
@@ -34,6 +35,10 @@ from crp.util import fingerprint, read_csv, read_json, sha256_file, write_csv, w
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _now_compact() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
 
 
 @dataclass(frozen=True)
@@ -72,6 +77,8 @@ class VersionComparison:
     source_fingerprint_to: str
     output_fingerprint_from: str
     output_fingerprint_to: str
+    same_execution: bool
+    content_reused_from_to: int | None
     added_files: tuple[str, ...]
     removed_files: tuple[str, ...]
     changed_files: tuple[str, ...]
@@ -97,9 +104,45 @@ class VersionComparison:
                 "from": self.output_fingerprint_from,
                 "to": self.output_fingerprint_to,
             },
+            "same_execution": self.same_execution,
+            "content_reused_from": {"from": None, "to": self.content_reused_from_to},
             "added_files": list(self.added_files),
             "removed_files": list(self.removed_files),
             "changed_files": list(self.changed_files),
+        }
+
+
+@dataclass(frozen=True)
+class RuleRevisionView:
+    """规则修订链路上的一个节点及其对应执行（若已导出）。
+
+    - ``config_same_as``：本修订的规则配置与此前哪一版修订完全相同（规则改回旧配置）；
+    - ``output_same_as``：本次执行的公开输出与此前哪一次执行字节相同（仅内容相同）；
+    - ``execution_version``：本修订首次导出产生的独立执行版本；同一修订下重复导出
+      幂等复用，属于同一次执行。
+    """
+
+    rules_version: int
+    changed_at: str
+    note: str
+    rules_hash: str
+    config_same_as: int | None
+    execution_version: int | None
+    source_fingerprint: str | None
+    output_fingerprint: str | None
+    output_same_as: int | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "rules_version": self.rules_version,
+            "changed_at": self.changed_at,
+            "note": self.note,
+            "rules_hash": self.rules_hash,
+            "config_same_as": self.config_same_as,
+            "execution_version": self.execution_version,
+            "source_fingerprint": self.source_fingerprint,
+            "output_fingerprint": self.output_fingerprint,
+            "output_same_as": self.output_same_as,
         }
 
 
@@ -190,12 +233,13 @@ class Exporter:
         tables = self.transform(batch)
         rules_fp, source_fp, output_fp = self.calculate_fingerprints(batch, tables)
         index = self._load_index(batch_id)
-        # 只有真正生效的规则与输入都相同，才允许复用同一执行身份。
+        # 只有真正生效的【规则修订】与输入都相同（即同一次修订下的重复导出），
+        # 才允许复用同一执行身份。规则改回旧配置时指纹可能相同，但修订号不同，
+        # 必须产生新的执行记录，不得冒充历史执行。
         for entry in index["versions"]:
             if (
-                entry["rules_fingerprint"] == rules_fp
+                int(entry["rules_version"]) == batch.rules_version
                 and entry["source_fingerprint"] == source_fp
-                and entry["output_fingerprint"] == output_fp
             ):
                 version = int(entry["version"])
                 version_dir = self.store.version_dir(batch_id, version)
@@ -203,18 +247,29 @@ class Exporter:
                 return ExportResult(batch_id, version, version_dir, True,
                                     int(entry["rules_version"]), entry["note"])
 
-        version = int(index.get("latest", 0)) + 1
+        self._cleanup_incomplete_dirs(batch_id, index)
+        # 中断重试：上次执行已完整落盘但索引尚未更新时，恢复该执行的索引归属。
+        recovered = self._recover_interrupted(
+            batch_id, index, batch.rules_version, rules_fp, source_fp, output_fp
+        )
+        if recovered is not None:
+            return recovered
+
+        # 历史迁移后磁盘上可能有索引之外的完整版本目录：版本号在现有目录与索引
+        # 共同之上顺延，迁移来的旧执行目录永不覆盖、继续可查。
+        version = self._next_version_number(batch_id, index)
         version_dir = self.store.version_dir(batch_id, version)
-        version_dir.mkdir(parents=True, exist_ok=False)
+        staging_dir = version_dir.with_name(f".staging-{version}-{_now_compact()}")
+        staging_dir.mkdir(parents=True, exist_ok=False)
         files: dict[str, str] = {}
         for exported in tables:
-            target = version_dir / f"{exported.table}.csv"
+            target = staging_dir / f"{exported.table}.csv"
             write_csv(target, exported.rows, exported.fieldnames)
             files[f"{exported.table}.csv"] = sha256_file(target)
         # 规则/输入已变，但最终字节可能恰好与旧版本一致：记录内容来源而非合并执行身份。
         content_reused_from = self._match_output_version(index, output_fp)
         if content_reused_from is not None:
-            self._verify_reused_content(batch_id, content_reused_from, files)
+            self._verify_reused_content(batch_id, index, content_reused_from, files)
         manifest = {
             "batch_id": batch_id,
             "version": version,
@@ -230,7 +285,13 @@ class Exporter:
             "reused_content": content_reused_from is not None,
             "files": dict(sorted(files.items())),
         }
-        write_json(version_dir / "manifest.json", manifest)
+        write_json(staging_dir / "manifest.json", manifest)
+        # 泄露自检针对暂存目录进行：失败时不留任何公开版本痕迹。
+        findings = scan_leaks_dir(staging_dir, batch.to_json())
+        if findings:
+            shutil.rmtree(staging_dir)
+            raise RuntimeError("导出结果泄露自检失败: " + "; ".join(findings))
+        staging_dir.replace(version_dir)
         final_files = {
             name: sha256_file(version_dir / name)
             for name in sorted(list(files) + ["manifest.json"])
@@ -251,11 +312,97 @@ class Exporter:
         index["latest"] = version
         index["versions"].append(entry)
         write_json(self.store.export_index(batch_id), index)
-        findings = scan_leaks(self.store, batch_id, version)
-        if findings:
-            raise RuntimeError("导出结果泄露自检失败: " + "; ".join(findings))
         return ExportResult(batch_id, version, version_dir, False, batch.rules_version,
                             manifest["note"], content_reused_from)
+
+    def _next_version_number(self, batch_id: str, index: dict[str, Any]) -> int:
+        highest = max((int(entry["version"]) for entry in index["versions"]), default=0)
+        export_dir = self.store.export_dir(batch_id)
+        if export_dir.exists():
+            for path in export_dir.iterdir():
+                if path.is_dir() and path.name.startswith("v"):
+                    suffix = path.name[1:]
+                    if suffix.isdigit():
+                        highest = max(highest, int(suffix))
+        return highest + 1
+
+    def _unindexed_dirs(self, batch_id: str, index: dict[str, Any]) -> list[tuple[int, Path]]:
+        export_dir = self.store.export_dir(batch_id)
+        indexed = {int(entry["version"]) for entry in index["versions"]}
+        if not export_dir.exists():
+            return []
+        found: list[tuple[int, Path]] = []
+        for path in export_dir.iterdir():
+            if not path.is_dir() or not path.name.startswith("v"):
+                continue
+            suffix = path.name[1:]
+            if suffix.isdigit() and int(suffix) not in indexed:
+                found.append((int(suffix), path))
+        return sorted(found)
+
+    def _cleanup_incomplete_dirs(self, batch_id: str, index: dict[str, Any]) -> None:
+        """删除中断留下的暂存/残缺目录；迁移来的完整版本（含 manifest）原样保留。"""
+        export_dir = self.store.export_dir(batch_id)
+        if not export_dir.exists():
+            return
+        indexed = {int(entry["version"]) for entry in index["versions"]}
+        for path in list(export_dir.iterdir()):
+            if not path.is_dir():
+                continue
+            if path.name.startswith(".staging-"):
+                shutil.rmtree(path)
+                continue
+            if path.name.startswith("v") and path.name[1:].isdigit():
+                number = int(path.name[1:])
+                if number not in indexed and not (path / "manifest.json").exists():
+                    shutil.rmtree(path)
+
+    def _recover_interrupted(
+        self, batch_id: str, index: dict[str, Any], rules_version: int,
+        rules_fp: str, source_fp: str, output_fp: str,
+    ) -> ExportResult | None:
+        """恢复已完整落盘但未登记索引的执行（崩溃发生在写索引之前或之中）。"""
+        for number, path in self._unindexed_dirs(batch_id, index):
+            manifest_path = path / "manifest.json"
+            if not manifest_path.exists():
+                continue
+            manifest = read_json(manifest_path)
+            if (
+                int(manifest.get("rules_version", -1)) != rules_version
+                or manifest.get("rules_fingerprint") != rules_fp
+                or manifest.get("source_fingerprint") != source_fp
+                or manifest.get("output_fingerprint") != output_fp
+            ):
+                continue
+            final_files = {
+                name: sha256_file(path / name)
+                for name in sorted(
+                    [p.name for p in path.iterdir() if p.is_file() and p.name != "manifest.json"]
+                    + ["manifest.json"]
+                )
+            }
+            entry = {
+                "version": number,
+                "created_at": manifest["created_at"],
+                "rules_version": rules_version,
+                "rules_fingerprint": rules_fp,
+                "source_fingerprint": source_fp,
+                "output_fingerprint": output_fp,
+                "content_reused_from": manifest.get("content_reused_from"),
+                "note": manifest["note"],
+                "dir": path.name,
+                "files": final_files,
+            }
+            index["batch_id"] = batch_id
+            index["latest"] = max(int(index.get("latest", 0)), number)
+            index["versions"].append(entry)
+            index["versions"].sort(key=lambda item: int(item["version"]))
+            write_json(self.store.export_index(batch_id), index)
+            return ExportResult(
+                batch_id, number, path, False, rules_version, manifest["note"],
+                manifest.get("content_reused_from"),
+            )
+        return None
 
     def _load_index(self, batch_id: str) -> dict[str, Any]:
         path = self.store.export_index(batch_id)
@@ -277,13 +424,13 @@ class Exporter:
         return None
 
     def _verify_reused_content(
-        self, batch_id: str, source_version: int, files: dict[str, str]
+        self, batch_id: str, index: dict[str, Any], source_version: int,
+        files: dict[str, str],
     ) -> None:
         """确认本次新写入的 CSV 与被引用版本逐文件字节一致。"""
         source_dir = self.store.version_dir(batch_id, source_version)
-        source_index = self._load_index(batch_id)
         source_entry = next(
-            entry for entry in source_index["versions"] if int(entry["version"]) == source_version
+            entry for entry in index["versions"] if int(entry["version"]) == source_version
         )
         for name, expected in files.items():
             actual = sha256_file(source_dir / name)
@@ -330,7 +477,50 @@ class Exporter:
             source_fingerprint_to=right["source_fingerprint"],
             output_fingerprint_from=left["output_fingerprint"],
             output_fingerprint_to=right["output_fingerprint"],
+            same_execution=version_a == version_b,
+            content_reused_from_to=right.get("content_reused_from"),
             added_files=added,
             removed_files=removed,
             changed_files=changed,
         )
+
+    def rule_trail(self, batch_id: str) -> list[RuleRevisionView]:
+        """沿规则修订顺序给出差异视图。
+
+        对每个规则修订区分三件事：
+        - 配置相同：rules_hash 与此前某修订相同（规则改回旧配置）；
+        - 输出相同：执行的公开输出字节与此前某执行相同（content 复用）；
+        - 同一次执行：同一修订下重复导出幂等复用，不产生新执行。
+        """
+        batch = self.batches.load(batch_id)
+        index = self._load_index(batch_id)
+        executions_by_revision: dict[int, dict[str, Any]] = {}
+        for entry in sorted(index["versions"], key=lambda item: int(item["version"])):
+            executions_by_revision.setdefault(int(entry["rules_version"]), entry)
+        seen_hashes: dict[str, int] = {}
+        seen_outputs: dict[str, int] = {}
+        views: list[RuleRevisionView] = []
+        for revision in batch.history:
+            rules_version = int(revision["rules_version"])
+            rules_hash = revision["rules_hash"]
+            config_same_as = seen_hashes.get(rules_hash)
+            execution = executions_by_revision.get(rules_version)
+            output_fp = execution["output_fingerprint"] if execution else None
+            output_same_as = seen_outputs.get(output_fp) if output_fp is not None else None
+            views.append(
+                RuleRevisionView(
+                    rules_version=rules_version,
+                    changed_at=revision["changed_at"],
+                    note=revision["note"],
+                    rules_hash=rules_hash,
+                    config_same_as=config_same_as,
+                    execution_version=int(execution["version"]) if execution else None,
+                    source_fingerprint=execution["source_fingerprint"] if execution else None,
+                    output_fingerprint=output_fp,
+                    output_same_as=output_same_as,
+                )
+            )
+            seen_hashes.setdefault(rules_hash, rules_version)
+            if output_fp is not None:
+                seen_outputs.setdefault(output_fp, rules_version)
+        return views

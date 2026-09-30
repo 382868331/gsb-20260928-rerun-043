@@ -82,12 +82,41 @@ def cmd_compare(args: argparse.Namespace) -> None:
     print(
         f"  规则版本: v{comparison.rules_version_from} -> v{comparison.rules_version_to}"
     )
+    if comparison.same_execution:
+        print("  执行身份: 同一次执行（同一版本）")
+    if comparison.content_reused_from_to is not None:
+        print(
+            "  输出相同: "
+            f"v{args.to_version:03d} 的公开内容复用自 v{comparison.content_reused_from_to:03d}"
+        )
     if comparison.added_files:
         print(f"  新增文件: {', '.join(comparison.added_files)}")
     if comparison.removed_files:
         print(f"  删除文件: {', '.join(comparison.removed_files)}")
     if comparison.changed_files:
         print(f"  内容变化文件: {', '.join(comparison.changed_files)}")
+
+
+def cmd_rule_trail(args: argparse.Namespace) -> None:
+    """沿规则修订顺序展示配置相同、输出相同与同一次执行的关系。"""
+    views = Exporter(_store(args)).rule_trail(args.batch_id)
+    print(f"批次 {args.batch_id} 规则修订链（共 {len(views)} 次修订）")
+    for view in views:
+        print(
+            f"规则v{view.rules_version} {view.changed_at} {view.note} "
+            f"rules_hash={view.rules_hash[:12]}"
+        )
+        if view.config_same_as is not None:
+            print(f"  配置相同: 与规则v{view.config_same_as} 配置一致（独立修订，留痕保留）")
+        if view.execution_version is None:
+            print("  执行: 尚未导出")
+            continue
+        print(f"  执行版本: v{view.execution_version:03d}")
+        if view.output_same_as is not None:
+            print(
+                f"  输出相同: 公开内容与规则v{view.output_same_as} 的执行字节一致"
+                "（仅内容复用，执行身份独立）"
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -119,6 +148,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("from_version", type=int)
     p.add_argument("to_version", type=int)
     p.set_defaults(func=cmd_compare)
+    p = sub.add_parser("rule-trail", help="沿规则修订顺序查看配置相同/输出相同/同一执行")
+    p.add_argument("batch_id")
+    p.set_defaults(func=cmd_rule_trail)
     return parser
 
 
