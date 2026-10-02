@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json as json_lib
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from crp.paths import Store
 from crp.rules import FieldRule, parse_rules
+from crp.scope import normalize_scope, scope_fingerprint
 from crp.util import read_json, stable_json, write_json
 
 
@@ -27,6 +30,7 @@ class Batch:
     created_at: str = ""
     updated_at: str = ""
     history: list[dict[str, Any]] = None  # type: ignore[assignment]
+    revisions: list[dict[str, Any]] | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -43,6 +47,7 @@ class Batch:
                 for table, rules in sorted(self.rules.items())
             },
             "history": self.history,
+            "revisions": self.revisions,
         }
 
 
@@ -69,6 +74,7 @@ class BatchStore:
         missing = [name for name in tables if not (self.store.raw_dir(batch_id) / f"{name}.csv").exists()]
         if missing:
             raise FileNotFoundError(f"批次 {batch_id} 缺少原始表文件: {', '.join(missing)}")
+        initial_scope = normalize_scope(config.get("scope"))
         rules = parse_rules(config.get("rules", {}))
         unknown = sorted(set(rules) - set(tables))
         if unknown:
@@ -84,7 +90,23 @@ class BatchStore:
             rules=rules,
             created_at=now,
             updated_at=now,
-            history=[{"rules_version": 1, "changed_at": now, "note": note, "rules_hash": rules_hash}],
+            history=[{
+                "rules_version": 1,
+                "changed_at": now,
+                "note": note,
+                "rules_hash": rules_hash,
+                "scope": initial_scope,
+                "scope_hash": scope_fingerprint(initial_scope),
+            }],
+            revisions=[{
+                "rules_version": 1,
+                "rules": {
+                    table: [rule.to_dict() for rule in table_rules]
+                    for table, table_rules in sorted(rules.items())
+                },
+                "scope": initial_scope,
+                "scope_hash": scope_fingerprint(initial_scope),
+            }],
         )
         write_json(target, batch.to_json())
         return batch
@@ -94,7 +116,7 @@ class BatchStore:
         if not target.exists():
             raise BatchNotFoundError(f"批次不存在: {batch_id}")
         raw = read_json(target)
-        return Batch(
+        batch = Batch(
             batch_id=raw["batch_id"],
             name=raw["name"],
             description=raw.get("description", ""),
@@ -105,9 +127,36 @@ class BatchStore:
             created_at=raw.get("created_at", ""),
             updated_at=raw.get("updated_at", ""),
             history=list(raw.get("history", [])),
+            revisions=list(raw.get("revisions", [])),
         )
+        if not batch.revisions:
+            revisions = []
+            previous_rules = {
+                table: [rule.to_dict() for rule in table_rules]
+                for table, table_rules in sorted(parse_rules(raw.get("rules", {})).items())
+            }
+            for item in batch.history:
+                version = int(item["rules_version"])
+                rules_hash = item.get("rules_hash")
+                revision_rules = _rules_from_hash(rules_hash) if rules_hash else previous_rules
+                previous_rules = revision_rules
+                revision_scope = item.get("scope", {"mode": "all"})
+                revisions.append({
+                    "rules_version": version,
+                    "rules": revision_rules,
+                    "scope": normalize_scope(revision_scope),
+                    "scope_hash": item.get("scope_hash", scope_fingerprint(revision_scope)),
+                })
+            batch.revisions = revisions
+        return batch
 
-    def update_rules(self, batch_id: str, new_rules: dict[str, Any], note: str) -> Batch:
+    def update_rules(
+        self,
+        batch_id: str,
+        new_rules: dict[str, Any],
+        note: str,
+        scope: dict[str, Any] | None = None,
+    ) -> Batch:
         batch = self.load(batch_id)
         parsed = parse_rules(new_rules)
         unknown = sorted(set(parsed) - set(batch.tables))
@@ -115,6 +164,7 @@ class BatchStore:
             raise ValueError(f"规则引用了未声明的表: {', '.join(unknown)}")
         next_version = batch.rules_version + 1
         now = _now()
+        normalized_scope = normalize_scope(scope)
         batch.rules = parsed
         batch.rules_version = next_version
         batch.updated_at = now
@@ -124,8 +174,20 @@ class BatchStore:
                 "changed_at": now,
                 "note": note,
                 "rules_hash": _rules_hash(parsed),
+                "scope": normalized_scope,
+                "scope_hash": scope_fingerprint(normalized_scope),
             }
         )
+        batch.revisions = list(batch.revisions or [])
+        batch.revisions.append({
+            "rules_version": next_version,
+            "rules": {
+                table: [rule.to_dict() for rule in table_rules]
+                for table, table_rules in sorted(parsed.items())
+            },
+            "scope": normalized_scope,
+            "scope_hash": scope_fingerprint(normalized_scope),
+        })
         write_json(self.store.batch_file(batch_id), batch.to_json())
         return batch
 
@@ -136,3 +198,10 @@ def _rules_hash(rules: dict[str, list[FieldRule]]) -> str:
         for table, table_rules in sorted(rules.items())
     }
     return stable_json(canonical)
+
+
+def _rules_from_hash(payload: str) -> dict[str, Any]:
+    try:
+        return json_lib.loads(payload)
+    except (TypeError, json_lib.JSONDecodeError):
+        return {}

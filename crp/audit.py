@@ -6,6 +6,7 @@ import csv
 import re
 
 from crp.paths import Store
+from crp.rules import parse_rules
 from crp.util import read_csv, read_json
 
 FORBIDDEN_EXPORT_NAMES = {"mapping.json", "secret"}
@@ -34,25 +35,45 @@ def _manual_payload(store: Store, batch_id: str) -> tuple[set[str], set[str]]:
 def scan_leaks(store: Store, batch_id: str, version: int) -> list[str]:
     batch = read_json(store.batch_file(batch_id))
     raw_ids, manual_phrases = _manual_payload(store, batch_id)
-    dropped: dict[str, set[str]] = {}
-    for table, rules in batch.get("rules", {}).items():
-        dropped[table] = {rule["field"] for rule in rules if rule.get("action") == "drop"}
+    current_version = version
+    dropped_by_version: dict[int, dict[str, set[str]]] = {}
+    for revision in batch.get("revisions", []):
+        revision_version = int(revision["rules_version"])
+        dropped_by_version[revision_version] = {
+            table: {rule.field for rule in rules if rule.action == "drop"}
+            for table, rules in parse_rules(revision.get("rules", {})).items()
+        }
+    if not dropped_by_version:
+        dropped_by_version[int(batch.get("rules_version", 1))] = {
+            table: {rule["field"] for rule in rules if rule.get("action") == "drop"}
+            for table, rules in batch.get("rules", {}).items()
+        }
     findings: list[str] = []
     version_dir = store.version_dir(batch_id, version)
+    trace_path = version_dir / "rule_trace.csv"
+    selected_versions: dict[str, dict[int, int]] = {}
+    if trace_path.exists():
+        for item in read_csv(trace_path):
+            selected_versions.setdefault(item["table"], {})[
+                int(item["output_row"])
+            ] = int(item["rules_version"])
     for path in sorted(version_dir.rglob("*")):
         if not path.is_file():
             continue
         if path.name in FORBIDDEN_EXPORT_NAMES:
             findings.append(f"公开版本包含禁止文件: {path.relative_to(version_dir)}")
-        if path.suffix != ".csv":
+        if path.suffix != ".csv" or path.name == "rule_trace.csv":
             continue
         table = path.stem
         with path.open("r", encoding="utf-8", newline="") as fh:
             header = next(csv.reader(fh))
-        for field_name in dropped.get(table, set()):
-            if field_name in header:
-                findings.append(f"{path.name} 仍包含应删除字段 {field_name}")
         for row_index, row in enumerate(read_csv(path), start=2):
+            selected_version = selected_versions.get(table, {}).get(
+                row_index, int(batch.get("rules_version", current_version))
+            )
+            for field_name in dropped_by_version.get(selected_version, {}).get(table, set()):
+                if field_name in header and row.get(field_name, ""):
+                    findings.append(f"{path.name}:{row_index} 仍包含应删除字段 {field_name}")
             joined = chr(32).join(row.values())
             for raw_id in raw_ids:
                 if raw_id and raw_id in joined:

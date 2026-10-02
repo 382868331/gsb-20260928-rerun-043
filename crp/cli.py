@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from crp.audit import cross_table_consistency, scan_leaks
@@ -24,8 +25,23 @@ def cmd_init_batch(args: argparse.Namespace) -> None:
 
 def cmd_update_rules(args: argparse.Namespace) -> None:
     new_rules = read_json(Path(args.rules))
-    batch = BatchStore(_store(args)).update_rules(args.batch_id, new_rules, note=args.note)
-    print(f"批次 {batch.batch_id} 字段规则已更新至 v{batch.rules_version}（旧版本说明保留）")
+    scope = None
+    if args.scope:
+        scope = json.loads(Path(args.scope).read_text(encoding="utf-8"))
+    elif args.scope_json:
+        scope = json.loads(args.scope_json)
+    batch = BatchStore(_store(args)).update_rules(args.batch_id, new_rules, note=args.note, scope=scope)
+    print(f"批次 {batch.batch_id} 字段规则已更新至 v{batch.rules_version}（旧版本说明与适用范围保留）")
+
+
+def cmd_preview_scope(args: argparse.Namespace) -> None:
+    if not args.scope and not args.scope_json:
+        raise SystemExit("必须通过 --scope 或 --scope-json 提供适用范围")
+    scope = json.loads(Path(args.scope).read_text(encoding="utf-8")) if args.scope else json.loads(args.scope_json)
+    preview = Exporter(_store(args)).preview_scope(args.batch_id, scope)
+    print(f"命中 {len(preview.included)} 条，范围外 {len(preview.excluded)} 条")
+    for item in preview.included:
+        print(f"  命中 {item['table']}:{item['row_number']} 受试者 {item['subject_id']}")
 
 
 def cmd_export(args: argparse.Namespace) -> None:
@@ -72,6 +88,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
     print(f"比较 v{args.from_version:03d} -> v{args.to_version:03d}")
     labels = (
         ("规则变化", comparison.rules_changed),
+        ("适用范围变化", comparison.scope_changed),
         ("输入数据变化", comparison.source_changed),
         ("最终内容变化", comparison.output_changed),
     )
@@ -126,7 +143,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("batch_id")
     p.add_argument("--rules", required=True, help="完整替换用的规则 JSON")
     p.add_argument("--note", required=True)
+    p.add_argument("--scope", help="适用范围 JSON 文件")
+    p.add_argument("--scope-json", help="内联适用范围 JSON")
     p.set_defaults(func=cmd_update_rules)
+    p = sub.add_parser("preview-scope", help="预览规则修订适用范围命中的记录")
+    p.add_argument("batch_id")
+    p.add_argument("--scope")
+    p.add_argument("--scope-json")
+    p.set_defaults(func=cmd_preview_scope)
     p = sub.add_parser("export", help="执行去标识导出")
     p.add_argument("batch_id")
     p.add_argument("--note", default="")

@@ -32,6 +32,10 @@ def _table(result, name: str):
     return read_csv(result.version_dir / f"{name}.csv")
 
 
+def _table_path(result, name: str):
+    return result.version_dir / f"{name}.csv"
+
+
 def test_export_removes_direct_identifiers(exporter):
     result = exporter.export_batch(BATCH, note="首版导出")
     demo = _table(result, "demographics")
@@ -132,7 +136,7 @@ def test_inert_rule_change_keeps_bytes_but_records_new_execution_identity(worksp
     first = exporter.export_batch(BATCH, note="v1：基线规则")
     v1_manifest = read_json(first.version_dir / "manifest.json")
     v1_bytes = {
-        p.name: p.read_bytes() for p in first.version_dir.glob("*.csv")
+        p.name: p.read_bytes() for p in first.version_dir.glob("*.csv") if p.name != "rule_trace.csv"
     }
 
     config = read_json(ROOT / "configs" / "study001.json")
@@ -152,7 +156,7 @@ def test_inert_rule_change_keeps_bytes_but_records_new_execution_identity(worksp
     assert v2_manifest["output_fingerprint"] == v1_manifest["output_fingerprint"]
     assert v2_manifest["content_reused_from"] == first.version
     v2_bytes = {
-        p.name: p.read_bytes() for p in second.version_dir.glob("*.csv")
+        p.name: p.read_bytes() for p in second.version_dir.glob("*.csv") if p.name != "rule_trace.csv"
     }
     assert v2_bytes == v1_bytes
     # 旧版本、旧说明、旧规则溯源原样可查。
@@ -326,3 +330,119 @@ def test_migrated_history_rebuilds_index_from_version_dirs(workspace, exporter):
     comparison = exporter.compare_versions(BATCH, first.version, second.version)
     assert comparison.rules_changed is True
     assert comparison.output_equal is False
+
+
+def test_scoped_rule_revision_preview_and_per_record_basis(workspace, exporter):
+    first = exporter.export_batch(BATCH, note="v1：全量旧规则")
+    scope = {
+        "time_range": {"start": "2024-02-01", "end": "2024-04-30"},
+        "fields": {
+            "visits": "visit_date",
+            "labs": "collected_at",
+            "medications": "start_date",
+        },
+    }
+    preview = exporter.preview_scope(BATCH, scope)
+    included = {(item["table"], item["row_number"]) for item in preview.included}
+    assert ("visits", 5) in included and ("visits", 4) not in included
+    assert ("medications", 4) in included and ("medications", 2) not in included
+
+    BatchStore(workspace).update_rules(
+        BATCH,
+        read_json(ROOT / "configs" / "study001_rules_v2.json"),
+        note="v2：仅 2 月起资料补充用药日期平移",
+        scope=scope,
+    )
+    second = exporter.export_batch(BATCH, note="v2：部分资料执行")
+    assert second.reused is False
+
+    trace = _table_path(second, "rule_trace")
+    decisions = read_csv(trace)
+    by_location = {(row["table"], int(row["source_row"])): row for row in decisions}
+    assert by_location[("visits", 4)]["rules_version"] == "1"
+    assert by_location[("visits", 5)]["rules_version"] == "2"
+    assert by_location[("medications", 2)]["rules_version"] == "1"
+    assert by_location[("medications", 4)]["rules_version"] == "2"
+    assert "适用范围" in by_location[("medications", 4)]["basis"]
+
+    medications = _table(second, "medications")
+    assert medications[0]["start_date"] == "2024-01-09"
+    assert medications[2]["start_date"] != "2024-02-02"
+    demographics = _table(second, "demographics")
+    assert "note" in demographics[0]
+    assert scan_leaks(exporter.store, BATCH, second.version) == []
+
+    comparison = exporter.compare_versions(BATCH, first.version, second.version)
+    assert comparison.rules_changed is True
+    assert comparison.scope_changed is True
+    assert comparison.source_changed is False
+    assert comparison.output_changed is True
+
+
+def test_scope_revision_is_immutable_and_new_records_are_evaluated_now(workspace, exporter):
+    exporter.export_batch(BATCH, note="v1")
+    med_only_scope = {"sources": ["medications"]}
+    BatchStore(workspace).update_rules(
+        BATCH,
+        read_json(ROOT / "configs" / "study001_rules_v2.json"),
+        note="v2：仅用药",
+        scope=med_only_scope,
+    )
+    scoped = exporter.export_batch(BATCH, note="v2：仅用药")
+    scoped_manifest = read_json(scoped.version_dir / "manifest.json")
+
+    BatchStore(workspace).update_rules(
+        BATCH,
+        read_json(ROOT / "configs" / "study001_rules_v2.json"),
+        note="v3：同内容扩大到检验",
+        scope={"sources": ["medications", "labs"]},
+    )
+    widened = exporter.export_batch(BATCH, note="v3：扩大范围")
+    assert widened.version == 3
+    widened_manifest = read_json(widened.version_dir / "manifest.json")
+    assert widened_manifest["rules_fingerprint"] == scoped_manifest["rules_fingerprint"]
+    assert widened_manifest["scope_fingerprint"] != scoped_manifest["scope_fingerprint"]
+    assert read_json(scoped.version_dir / "manifest.json") == scoped_manifest
+
+    labs = workspace.raw_dir(BATCH) / "labs.csv"
+    with labs.open("a", encoding="utf-8", newline="") as fh:
+        fh.write("PT001,V003,LDL,2024-05-02,3.1,mmol/L,新增后核对\n")
+    retried = exporter.export_batch(BATCH, note="v3：新增后重跑")
+    assert retried.version == 4
+    assert retried.reused is False
+    decisions = read_csv(_table_path(retried, "rule_trace"))
+    new_row = next(
+        item for item in decisions
+        if item["table"] == "labs" and int(item["source_row"]) == 7
+    )
+    assert new_row["rules_version"] == "3"
+    assert new_row["scope"] == "来源=medications,labs"
+
+    rebuilt = exporter._load_index(BATCH)
+    exporter.store.export_index(BATCH).unlink()
+    rebuilt_after_migration = exporter._load_index(BATCH)
+    assert [entry["scope_fingerprint"] for entry in rebuilt["versions"]] == [
+        entry["scope_fingerprint"] for entry in rebuilt_after_migration["versions"]
+    ]
+
+
+def test_explicit_record_collection_uses_row_number_and_does_not_borrow_other_batch(workspace, exporter):
+    exporter.export_batch(BATCH, note="v1")
+    scope = {"records": [{"table": "demographics", "row_number": 2}]}
+    preview = exporter.preview_scope(BATCH, scope)
+    assert len(preview.included) == 1
+    assert preview.included[0]["table"] == "demographics"
+    assert preview.included[0]["row_number"] == 2
+
+    BatchStore(workspace).update_rules(
+        BATCH,
+        read_json(ROOT / "configs" / "study001_rules_v2.json"),
+        note="v2：仅首条人口学记录",
+        scope=scope,
+    )
+    result = exporter.export_batch(BATCH, note="v2：明确集合")
+    decisions = read_csv(_table_path(result, "rule_trace"))
+    versions = {(item["table"], int(item["source_row"])): item["rules_version"] for item in decisions}
+    assert versions[("demographics", 2)] == "2"
+    assert versions[("demographics", 3)] == "1"
+    assert scan_leaks(exporter.store, BATCH, result.version) == []

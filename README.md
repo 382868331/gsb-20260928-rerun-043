@@ -39,9 +39,12 @@ python -m crp export STUDY-001   # 规则/数据未变：幂等复用同一版�
 python -m crp update-rules STUDY-001 --rules configs/study001_rules_v2.json \
     --note 'v2：删除人口学备注并补充用药日期平移'
 python -m crp export STUDY-001 --note 'v2：删除人口学备注并补充用药日期平移'
+python -m crp preview-scope STUDY-001 --scope-json '{"sources":["medications"]}'
+python -m crp update-rules STUDY-001 --rules configs/study001_rules_v2.json \
+    --note 'v3：仅用药资料' --scope-json '{"sources":["medications"]}'
 python -m crp versions STUDY-001
 
-# 比较两次导出在规则、输入数据、最终内容三个维度上的变化
+# 比较两次导出在规则内容、适用范围、输入数据、最终内容四个维度上的变化
 python -m crp compare STUDY-001 1 2
 
 # 沿规则修订顺序查看每次执行：标注配置相同/输出相同/同一次执行重跑/内容复用
@@ -61,8 +64,11 @@ python -m crp rule-trail STUDY-001
   即使去标识后最终字节恰好与旧版本完全一致（例如规则调整未实际触发任何替换），
   也不会把执行身份合并到旧版本，而是在 manifest 中以 `content_reused_from` 标注内容来源版本；
 - 旧版本目录、旧版本说明与 `data/private/` 中的伪名/日期偏移映射永不覆盖、继续可查；
+- 规则修订可声明 `scope`，支持 `sources`、`subjects`、`time_range.fields`、`records`；导出按最新命中修订向旧修订回退，范围外沿用旧规则；
+- 每次导出写入公开 `rule_trace.csv`，逐行记录来源行、输出行、伪名、业务记录键、规则修订号、适用范围与采用依据；
+- 扩大或缩小适用范围产生新执行；旧 manifest、旧轨迹和旧采用范围不改写；新增来源记录在执行当时重新判定；
   历史目录迁移后即使丢失索引，也能从不可变版本目录重建 `index.json`；
-- `compare vA vB` 分别报告规则变化、输入数据变化、最终内容变化，并明确区分三个层次：
+- `compare vA vB` 分别报告规则内容变化、适用范围变化、输入数据变化、最终内容变化，并明确区分三个层次：
   **配置相同**（规则指纹一致但修订号可以不同）、**公开输出相同**（字节一致但属不同执行）、
   **属于同一次执行**（规则修订号与输入均一致，即幂等重跑），同时列出新增/删除/内容变化的文件；
 - `rule-trail` 沿规则修订顺序列出全部执行，逐条标注「规则配置退回/重复」「公开输出与上一版相同」
