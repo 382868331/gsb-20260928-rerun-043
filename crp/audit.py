@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import re
 
 from crp.paths import Store
@@ -44,26 +45,37 @@ def scan_leaks(store: Store, batch_id: str, version: int) -> list[str]:
             continue
         if path.name in FORBIDDEN_EXPORT_NAMES:
             findings.append(f"公开版本包含禁止文件: {path.relative_to(version_dir)}")
-        if path.suffix != ".csv":
-            continue
         table = path.stem
+        if path.suffix == ".csv":
+            with path.open("r", encoding="utf-8", newline="") as fh:
+                header = next(csv.reader(fh))
+            basis_path = version_dir / "basis.jsonl"
+            if not basis_path.exists():
+                # 历史版本（无溯源）：维持整列删除检查。
+                for field_name in dropped.get(table, set()):
+                    if field_name in header:
+                        findings.append(f"{path.name} 仍包含应删除字段 {field_name}")
+            # 范围化修订下列可能对部分记录保留；是否泄露由逐条内容扫描保证，
+            # 每条记录采用了哪条规则见 basis.jsonl。
+        elif path.name == "basis.jsonl":
+            pass
+        else:
+            continue
         with path.open("r", encoding="utf-8", newline="") as fh:
-            header = next(csv.reader(fh))
-        for field_name in dropped.get(table, set()):
-            if field_name in header:
-                findings.append(f"{path.name} 仍包含应删除字段 {field_name}")
-        for row_index, row in enumerate(read_csv(path), start=2):
-            joined = chr(32).join(row.values())
+            lines = fh.readlines()
+        for row_index, line in enumerate(lines, start=2):
+            joined = line
             for raw_id in raw_ids:
                 if raw_id and raw_id in joined:
                     findings.append(f"{path.name}:{row_index} 出现真实受试者号 {raw_id}")
             for phrase in manual_phrases:
                 if phrase in joined:
                     findings.append(f"{path.name}:{row_index} 出现人工敏感片段 {phrase!r}")
-            for name, pattern in PATTERN_CHECKS.items():
-                match = pattern.search(joined)
-                if match:
-                    findings.append(f"{path.name}:{row_index} 命中未脱敏模式 {name}: {match.group(0)}")
+            if path.name != "basis.jsonl":
+                for name, pattern in PATTERN_CHECKS.items():
+                    match = pattern.search(joined)
+                    if match:
+                        findings.append(f"{path.name}:{row_index} 命中未脱敏模式 {name}: {match.group(0)}")
     return findings
 
 

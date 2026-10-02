@@ -9,6 +9,7 @@ from crp.audit import cross_table_consistency, scan_leaks
 from crp.batch import BatchStore
 from crp.exporter import Exporter
 from crp.paths import Store
+from crp.scope import Scope
 from crp.util import read_json
 
 
@@ -24,8 +25,40 @@ def cmd_init_batch(args: argparse.Namespace) -> None:
 
 def cmd_update_rules(args: argparse.Namespace) -> None:
     new_rules = read_json(Path(args.rules))
-    batch = BatchStore(_store(args)).update_rules(args.batch_id, new_rules, note=args.note)
+    scope = Scope.parse(read_json(Path(args.scope))) if args.scope else Scope.all_records()
+    batch = BatchStore(_store(args)).update_rules(
+        args.batch_id, new_rules, note=args.note, scope=scope
+    )
     print(f"批次 {batch.batch_id} 字段规则已更新至 v{batch.rules_version}（旧版本说明保留）")
+    print(f"本次修订适用范围：{_scope_text(scope)}")
+
+
+def _scope_text(scope: Scope) -> str:
+    if scope.is_all:
+        return "全部资料"
+    parts: list[str] = []
+    if scope.tables:
+        parts.append("来源表 " + ",".join(sorted(scope.tables)))
+    for table, date_range in sorted(scope.date_ranges.items()):
+        parts.append(f"{table}.{date_range.spec}")
+    for table, keys in sorted(scope.records.items()):
+        parts.append(f"{table} 明确集合 {len(keys)} 条")
+    return "；".join(parts) or "空范围"
+
+
+def cmd_preview_scope(args: argparse.Namespace) -> None:
+    rows = Exporter(_store(args)).preview_scope(args.batch_id, args.rules_version)
+    matched = [row for row in rows if row.matched]
+    print(
+        f"规则修订 v{args.rules_version} 适用范围预览："
+        f"{len(matched)}/{len(rows)} 条记录采用新规则，其余沿用更早规则"
+    )
+    for row in rows:
+        mark = "采用新规则" if row.matched else "范围外沿用旧规则"
+        print(
+            f"  {row.table}:{row.record_key}（受试者 {row.subject_id}）{mark} "
+            f"-> 依据 v{row.rules_version}，命中依据 {row.matched_by}"
+        )
 
 
 def cmd_export(args: argparse.Namespace) -> None:
@@ -72,6 +105,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
     print(f"比较 v{args.from_version:03d} -> v{args.to_version:03d}")
     labels = (
         ("规则变化", comparison.rules_changed),
+        ("适用范围变化", comparison.scope_changed),
         ("输入数据变化", comparison.source_changed),
         ("最终内容变化", comparison.output_changed),
     )
@@ -102,8 +136,10 @@ def cmd_rule_trail(args: argparse.Namespace) -> None:
         tags: list[str] = []
         if item["same_execution_as_previous"]:
             tags.append("同一次执行重跑")
-        elif item["rules_config_equal_previous"]:
+        elif item["rules_config_equal_previous"] and item["scope_equal_previous"]:
             tags.append("规则配置退回/重复")
+        if not item["scope_equal_previous"] and item["same_execution_as_previous"] is False and item["version"] != 1:
+            tags.append("适用范围变化")
         if item["output_equal_previous"] and not item["same_execution_as_previous"]:
             tags.append("公开输出与上一版相同")
         if item["content_reused_from"] is not None:
@@ -126,7 +162,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("batch_id")
     p.add_argument("--rules", required=True, help="完整替换用的规则 JSON")
     p.add_argument("--note", required=True)
+    p.add_argument("--scope", default=None, help="适用范围 JSON：tables/date_range/records；缺省为全部资料")
     p.set_defaults(func=cmd_update_rules)
+    p = sub.add_parser("preview-scope", help="预览某次规则修订将对哪些记录生效")
+    p.add_argument("batch_id")
+    p.add_argument("rules_version", type=int)
+    p.set_defaults(func=cmd_preview_scope)
     p = sub.add_parser("export", help="执行去标识导出")
     p.add_argument("batch_id")
     p.add_argument("--note", default="")

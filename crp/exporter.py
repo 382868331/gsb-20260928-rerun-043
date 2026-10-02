@@ -17,6 +17,8 @@ private/ 目录，绝不写入版本目录。每次导出都会做泄露自检�
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,13 +26,15 @@ from pathlib import Path
 from typing import Any
 
 from crp.audit import scan_leaks
-from crp.batch import Batch, BatchStore
+from crp.batch import Batch, BatchStore, RuleRevision, revision_plan
 from crp.dates import shift_date
 from crp.paths import Store
 from crp.pseudonym import SubjectMapping
 from crp.redact import Redactor
 from crp.rules import FieldRule
+from crp.scope import Scope, record_key
 from crp.util import fingerprint, read_csv, read_json, sha256_file, write_csv, write_json
+from crp.util import stable_json
 
 
 def _now() -> str:
@@ -42,6 +46,56 @@ class TableExport:
     table: str
     fieldnames: list[str]
     rows: list[dict[str, str]]
+
+
+@dataclass(frozen=True)
+class RecordBasis:
+    """公开溯源：一条原始记录本次导出采用了哪次规则决定、为何采用。"""
+
+    table: str
+    record_key: str
+    subject_pseudonym: str
+    rules_version: int
+    revision_note: str
+    matched_by: str
+    scope: dict[str, Any]
+    actions: dict[str, str]
+    date_shift_fields: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "table": self.table,
+            "record_key": self.record_key,
+            "subject_id": self.subject_pseudonym,
+            "rules_version": self.rules_version,
+            "revision_note": self.revision_note,
+            "matched_by": self.matched_by,
+            "scope": self.scope,
+            "actions": dict(sorted(self.actions.items())),
+            "date_shift_fields": list(self.date_shift_fields),
+        }
+
+
+@dataclass(frozen=True)
+class ScopePreviewRow:
+    table: str
+    record_key: str
+    subject_id: str
+    rules_version: int
+    matched: bool
+    matched_by: str
+    revision_note: str
+
+
+def _public_scope(scope: Scope) -> dict[str, Any]:
+    """公开溯源中的范围描述：明确集合只给数量，不暴露真实记录键。"""
+    payload = scope.to_dict()
+    records = payload.get("records")
+    if records:
+        payload["records"] = {
+            table: {"count": len(keys)} for table, keys in sorted(records.items())
+        }
+    return payload
 
 
 @dataclass(frozen=True)
@@ -63,6 +117,7 @@ class VersionComparison:
     from_version: int
     to_version: int
     rules_changed: bool
+    scope_changed: bool
     source_changed: bool
     output_changed: bool
     rules_config_equal: bool
@@ -72,6 +127,8 @@ class VersionComparison:
     rules_version_to: int
     rules_fingerprint_from: str
     rules_fingerprint_to: str
+    scope_fingerprint_from: str
+    scope_fingerprint_to: str
     source_fingerprint_from: str
     source_fingerprint_to: str
     output_fingerprint_from: str
@@ -86,6 +143,7 @@ class VersionComparison:
             "from_version": self.from_version,
             "to_version": self.to_version,
             "rules_changed": self.rules_changed,
+            "scope_changed": self.scope_changed,
             "source_changed": self.source_changed,
             "output_changed": self.output_changed,
             "rules_config_equal": self.rules_config_equal,
@@ -95,6 +153,10 @@ class VersionComparison:
             "rules_fingerprint": {
                 "from": self.rules_fingerprint_from,
                 "to": self.rules_fingerprint_to,
+            },
+            "scope_fingerprint": {
+                "from": self.scope_fingerprint_from,
+                "to": self.scope_fingerprint_to,
             },
             "source_fingerprint": {
                 "from": self.source_fingerprint_from,
@@ -118,14 +180,45 @@ class Exporter:
     def _rule_map(self, batch: Batch) -> dict[str, dict[str, FieldRule]]:
         return {table: {rule.field: rule for rule in rules} for table, rules in batch.rules.items()}
 
-    def transform(self, batch: Batch) -> list[TableExport]:
-        mapping = SubjectMapping.load_or_create(self.store, batch.batch_id)
-        raw_rows: dict[str, list[dict[str, str]]] = {}
-        all_subjects: set[str] = set()
+    def _revisions(self, batch: Batch) -> list[RuleRevision]:
+        revisions = revision_plan(batch.history)
+        if not revisions:
+            raise RuntimeError(f"批次 {batch.batch_id} 缺少规则修订历史")
+        return revisions
+
+    def resolve_plan(
+        self, batch: Batch
+    ) -> tuple[dict[str, list[tuple[dict[str, str], RuleRevision, str]]], list[RuleRevision]]:
+        """逐条原始记录解析本次生效的规则修订及范围命中原因。
+
+        沿修订号从早到晚判定：修订只对其范围内的记录生效，范围外的记录
+        继续沿用更早的有效修订。来源新增记录在此刻重新参与范围判断，
+        不借用任何历史执行的结论。
+        """
+        revisions = self._revisions(batch)
+        decisions: dict[str, list[tuple[dict[str, str], RuleRevision, str]]] = {}
         for table in batch.tables:
             rows = read_csv(self.store.raw_dir(batch.batch_id) / f"{table}.csv")
-            raw_rows[table] = rows
+            chosen: list[tuple[dict[str, str], RuleRevision, str]] = []
             for row in rows:
+                winner = revisions[0]
+                reason = "all"
+                for revision in revisions[1:]:
+                    matched, matched_by = revision.scope.match(table, row)
+                    if matched:
+                        winner, reason = revision, matched_by
+                chosen.append((row, winner, reason))
+            decisions[table] = chosen
+        return decisions, revisions
+
+    def transform(
+        self, batch: Batch
+    ) -> tuple[list[TableExport], list[RecordBasis]]:
+        mapping = SubjectMapping.load_or_create(self.store, batch.batch_id)
+        decisions, revisions = self.resolve_plan(batch)
+        all_subjects: set[str] = set()
+        for table in batch.tables:
+            for row, _revision, _reason in decisions[table]:
                 sid = row.get(batch.subject_field, "").strip()
                 if sid:
                     all_subjects.add(sid)
@@ -134,51 +227,151 @@ class Exporter:
         mapping.save(self.store)
 
         redactor = Redactor.from_batch(self.store.raw_dir(batch.batch_id))
-        rule_map = self._rule_map(batch)
         exports: list[TableExport] = []
+        bases: list[RecordBasis] = []
         for table in batch.tables:
-            rows = raw_rows[table]
+            rows = [item[0] for item in decisions[table]]
             with (self.store.raw_dir(batch.batch_id) / f"{table}.csv").open(
                 "r", encoding="utf-8-sig", newline=""
             ) as fh:
                 columns = next(csv.reader(fh))
-            table_rules = rule_map.get(table, {})
-            for name in table_rules:
+            revision_rules = [
+                {rule.field: rule for rule in revision.rules.get(table, [])}
+                for revision in revisions
+            ]
+            all_rule_fields: set[str] = set()
+            for table_rule_map in revision_rules:
+                all_rule_fields.update(table_rule_map)
+            for name in all_rule_fields:
                 if name not in columns:
                     raise ValueError(f"表 {table} 的规则字段不存在: {name}")
             if batch.subject_field not in columns:
                 raise ValueError(f"表 {table} 缺少受试者关联列 {batch.subject_field}")
-            subject_rule = table_rules.get(batch.subject_field)
-            if subject_rule is not None and subject_rule.action == "drop":
+            if any(
+                table_rule_map.get(batch.subject_field) is not None
+                and table_rule_map[batch.subject_field].action == "drop"
+                for table_rule_map in revision_rules
+            ):
                 raise ValueError(f"受试者关联列 {batch.subject_field} 不能删除，否则跨表关联会丢失")
+            def _kept_by_revision(revision: RuleRevision, column: str) -> bool:
+                if column == batch.subject_field:
+                    return True
+                field_rule = next(
+                    (
+                        field_rule for field_rule in revision.rules.get(table, [])
+                        if field_rule.field == column
+                    ),
+                    None,
+                )
+                return field_rule is None or field_rule.action != "drop"
+
             output_columns = [
                 column for column in columns
-                if (rule := table_rules.get(column)) is None or rule.action != "drop"
+                if any(
+                    _kept_by_revision(chosen_revision, column)
+                    for _chosen_row, chosen_revision, _chosen_reason in decisions[table]
+                )
             ]
             out_rows: list[dict[str, str]] = []
-            for row in rows:
+            for row, revision, matched_by in decisions[table]:
                 real_sid = row[batch.subject_field].strip()
                 pseudo_sid, offset_days = mapping.register(real_sid)
+                table_rules = {
+                    rule.field: rule for rule in revision.rules.get(table, [])
+                }
                 out: dict[str, str] = {}
+                actions: dict[str, str] = {}
+                date_shift_fields: list[str] = []
                 for column in output_columns:
                     value = row.get(column, "")
                     if column == batch.subject_field:
                         out[column] = pseudo_sid
+                        actions[column] = "pseudonymize"
                         continue
                     rule = table_rules.get(column)
                     if rule is None or rule.action == "keep":
                         out[column] = value
+                        actions[column] = "keep"
                     elif rule.action == "date_shift":
                         out[column] = shift_date(value, offset_days)
+                        actions[column] = (
+                            f"date_shift(offset_days={offset_days},per_subject_fixed)"
+                        )
+                        date_shift_fields.append(column)
                     elif rule.action == "redact_text":
                         out[column] = redactor.redact(value, real_sid)
+                        actions[column] = "redact_text"
+                    elif rule.action == "drop":
+                        out[column] = ""
+                        actions[column] = "drop"
                     else:
                         raise AssertionError(rule.action)
                 out_rows.append(out)
+                for column in columns:
+                    if column in output_columns:
+                        continue
+                    actions[column] = "drop"
+                    rule = table_rules.get(column)
+                    if rule is not None and rule.action == "date_shift":
+                        date_shift_fields.append(column)
+                bases.append(
+                    RecordBasis(
+                        table=table,
+                        record_key=mapping.record_ref(table, record_key(row)),
+                        subject_pseudonym=pseudo_sid,
+                        rules_version=revision.version,
+                        revision_note=revision.note,
+                        matched_by=matched_by,
+                        scope=_public_scope(revision.scope),
+                        actions=actions,
+                        date_shift_fields=tuple(sorted(set(date_shift_fields))),
+                    )
+                )
             exports.append(TableExport(table=table, fieldnames=output_columns, rows=out_rows))
-        return exports
+        return exports, bases
 
-    def calculate_fingerprints(self, batch: Batch, tables: list[TableExport]) -> tuple[str, str, str]:
+    def preview_scope(self, batch_id: str, rules_version: int) -> list[ScopePreviewRow]:
+        """预览某次修订的适用范围：命中记录采用新规则，范围外沿用旧规则。"""
+        batch = self.batches.load(batch_id)
+        revisions = self._revisions(batch)
+        target = next(
+            (revision for revision in revisions if revision.version == rules_version), None
+        )
+        if target is None:
+            raise ValueError(f"规则修订不存在: v{rules_version}")
+        preview: list[ScopePreviewRow] = []
+        for table in batch.tables:
+            rows = read_csv(self.store.raw_dir(batch.batch_id) / f"{table}.csv")
+            for row in rows:
+                matched, matched_by = target.scope.match(table, row)
+                winner = target
+                if not matched:
+                    earlier = [
+                        revision for revision in revisions
+                        if revision.version < rules_version
+                    ]
+                    winner = earlier[-1] if earlier else revisions[0]
+                    matched_by = f"out_of_scope:continues_v{winner.version}"
+                preview.append(
+                    ScopePreviewRow(
+                        table=table,
+                        record_key=record_key(row),
+                        subject_id=row.get(batch.subject_field, "").strip(),
+                        rules_version=winner.version,
+                        matched=matched,
+                        matched_by=matched_by,
+                        revision_note=winner.note,
+                    )
+                )
+        return preview
+
+    def calculate_fingerprints(
+        self,
+        batch: Batch,
+        tables: list[TableExport],
+        bases: list[RecordBasis],
+        revisions: list[RuleRevision],
+    ) -> tuple[str, str, str, str, str]:
         raw_parts: list[tuple[str, str]] = []
         out_parts: list[tuple[str, str]] = []
         for table in batch.tables:
@@ -189,19 +382,66 @@ class Exporter:
             for row in exported.rows:
                 lines.append(",".join(row.get(name, "") for name in exported.fieldnames))
             out_parts.append((exported.table, chr(10).join(lines) + chr(10)))
-        rules_canonical = read_json(self.store.batch_file(batch.batch_id))["history"][-1]["rules_hash"]
-        return rules_canonical, fingerprint(raw_parts), fingerprint(out_parts)
+        # 规则内容指纹：每条记录实际采用的字段规则（含字段动作）多重集合。
+        # 规则配置退回早期内容时此指纹相同；适用对象不同则不影响该值，二者分开报告。
+        rule_lines: set[str] = set()
+        # 适用范围指纹：每条记录最终由哪次修订决定（修订号+命中原因），
+        # 体现范围扩大/缩小以及新增记录落入哪一批。
+        scope_lines: list[str] = []
+        # 执行计划指纹：修订号、规则内容与范围声明的完整快照。
+        # 即使规则内容与历史相同（配置退回）、范围不同，计划也不同，执行身份绝不合并。
+        plan_lines: list[str] = []
+        for revision in revisions:
+            plan_lines.append(
+                stable_json({
+                    "version": revision.version,
+                    "rules": {
+                        table: [rule.to_dict() for rule in table_rules]
+                        for table, table_rules in sorted(revision.rules.items())
+                    },
+                    "scope": revision.scope.to_dict(),
+                })
+            )
+        for basis in sorted(bases, key=lambda item: (item.table, item.record_key)):
+            revision = next(
+                revision for revision in revisions if revision.version == basis.rules_version
+            )
+            rule_lines.add(
+                stable_json({
+                    "table": basis.table,
+                    "rules": [
+                        rule.to_dict()
+                        for rule in revision.rules.get(basis.table, [])
+                    ],
+                })
+            )
+            scope_lines.append(
+                f"{basis.table}\0{basis.record_key}\0v{basis.rules_version}\0{basis.matched_by}"
+            )
+        rules_content_fp = hashlib.sha256(
+            ("\n".join(sorted(rule_lines))).encode("utf-8")
+        ).hexdigest()
+        scope_fp = hashlib.sha256(
+            ("\n".join(sorted(scope_lines))).encode("utf-8")
+        ).hexdigest()
+        plan_fp = hashlib.sha256(
+            ("\n".join(plan_lines)).encode("utf-8")
+        ).hexdigest()
+        return rules_content_fp, scope_fp, plan_fp, fingerprint(raw_parts), fingerprint(out_parts)
 
     def export_batch(self, batch_id: str, note: str = "") -> ExportResult:
         batch = self.batches.load(batch_id)
-        tables = self.transform(batch)
-        rules_fp, source_fp, output_fp = self.calculate_fingerprints(batch, tables)
+        tables, bases = self.transform(batch)
+        decisions, revisions = self.resolve_plan(batch)
+        rules_fp, scope_fp, plan_fp, source_fp, output_fp = self.calculate_fingerprints(
+            batch, tables, bases, revisions
+        )
         index = self._load_index(batch_id)
-        # 执行身份由「真正生效的规则修订号 + 输入指纹」唯一确定：
-        # 规则退回旧配置时配置指纹虽然相同，但修订号已前进，必须产生新执行。
+        # 执行身份由「完整规则计划（修订号+规则内容+适用范围）+ 输入指纹」唯一确定：
+        # 规则退回旧配置或范围扩大/缩小都会前进计划指纹，必须产生新执行。
         for entry in index["versions"]:
             if (
-                int(entry["rules_version"]) == batch.rules_version
+                entry.get("plan_fingerprint", "") == plan_fp
                 and entry["source_fingerprint"] == source_fp
             ):
                 version = int(entry["version"])
@@ -223,8 +463,8 @@ class Exporter:
         version_dir.mkdir(parents=True, exist_ok=False)
         try:
             content_reused_from = self._commit_version(
-                batch, tables, version, version_dir, index,
-                rules_fp, source_fp, output_fp, note,
+                batch, tables, bases, version, version_dir, index,
+                rules_fp, scope_fp, plan_fp, source_fp, output_fp, note,
             )
         except BaseException:
             # 中断/自检失败后清掉不完整目录，下次重试得到干净的新版本号，旧执行不受影响。
@@ -234,14 +474,23 @@ class Exporter:
                             note or f"字段规则 v{batch.rules_version} 导出", content_reused_from)
 
     def _commit_version(
-        self, batch: Batch, tables: list[TableExport], version: int, version_dir: Path,
-        index: dict[str, Any], rules_fp: str, source_fp: str, output_fp: str, note: str,
+        self, batch: Batch, tables: list[TableExport], bases: list[RecordBasis],
+        version: int, version_dir: Path, index: dict[str, Any],
+        rules_fp: str, scope_fp: str, plan_fp: str,
+        source_fp: str, output_fp: str, note: str,
     ) -> int | None:
         files: dict[str, str] = {}
         for exported in tables:
             target = version_dir / f"{exported.table}.csv"
             write_csv(target, exported.rows, exported.fieldnames)
             files[f"{exported.table}.csv"] = sha256_file(target)
+        # 公开溯源：逐条记录说明本次采用的规则修订、范围命中依据与日期处理。
+        basis_path = version_dir / "basis.jsonl"
+        with basis_path.open("w", encoding="utf-8", newline="") as fh:
+            for basis in sorted(bases, key=lambda item: (item.table, item.record_key)):
+                fh.write(json.dumps(basis.to_dict(), ensure_ascii=False, sort_keys=True))
+                fh.write("\n")
+        files["basis.jsonl"] = sha256_file(basis_path)
         # 规则/输入已变，但最终字节可能恰好与旧版本一致：记录内容来源而非合并执行身份。
         content_reused_from = self._match_output_version(index, output_fp)
         if content_reused_from is not None:
@@ -256,6 +505,8 @@ class Exporter:
             "subject_field": batch.subject_field,
             "tables": batch.tables,
             "rules_fingerprint": rules_fp,
+            "scope_fingerprint": scope_fp,
+            "plan_fingerprint": plan_fp,
             "source_fingerprint": source_fp,
             "output_fingerprint": output_fp,
             "content_reused_from": content_reused_from,
@@ -275,6 +526,8 @@ class Exporter:
             "created_at": manifest["created_at"],
             "rules_version": batch.rules_version,
             "rules_fingerprint": rules_fp,
+            "scope_fingerprint": scope_fp,
+            "plan_fingerprint": plan_fp,
             "source_fingerprint": source_fp,
             "output_fingerprint": output_fp,
             "content_reused_from": content_reused_from,
@@ -337,6 +590,12 @@ class Exporter:
             "created_at": manifest["created_at"],
             "rules_version": int(manifest["rules_version"]),
             "rules_fingerprint": manifest["rules_fingerprint"],
+            "scope_fingerprint": manifest.get("scope_fingerprint", ""),
+            "plan_fingerprint": manifest.get(
+                "plan_fingerprint",
+                # 迁移自旧版本（无范围概念）：用规则修订号充当计划指纹，保证身份不被错误合并。
+                f"legacy:v{int(manifest['rules_version'])}",
+            ),
             "source_fingerprint": manifest["source_fingerprint"],
             "output_fingerprint": manifest["output_fingerprint"],
             "content_reused_from": manifest.get("content_reused_from"),
@@ -370,6 +629,9 @@ class Exporter:
             entry for entry in index["versions"] if int(entry["version"]) == source_version
         )
         for name, expected in files.items():
+            if not name.endswith(".csv"):
+                # 内容复用仅指公开 CSV 字节一致；溯源 basis.jsonl 属于本次执行，允许不同。
+                continue
             actual = sha256_file(source_dir / name)
             if actual != expected or source_entry["files"].get(name) != expected:
                 raise RuntimeError(
@@ -404,19 +666,24 @@ class Exporter:
             from_version=version_a,
             to_version=version_b,
             rules_changed=left["rules_fingerprint"] != right["rules_fingerprint"],
+            scope_changed=left.get("scope_fingerprint", "")
+            != right.get("scope_fingerprint", ""),
             source_changed=left["source_fingerprint"] != right["source_fingerprint"],
             output_changed=left["output_fingerprint"] != right["output_fingerprint"],
             # 三个层次：配置指纹相同（修订号可以不同）、公开输出字节相同、同一次执行（幂等重跑）。
             rules_config_equal=left["rules_fingerprint"] == right["rules_fingerprint"],
             output_equal=left["output_fingerprint"] == right["output_fingerprint"],
             same_execution=(
-                int(left["rules_version"]) == int(right["rules_version"])
+                left.get("plan_fingerprint", f"legacy:v{int(left['rules_version'])}")
+                == right.get("plan_fingerprint", f"legacy:v{int(right['rules_version'])}")
                 and left["source_fingerprint"] == right["source_fingerprint"]
             ),
             rules_version_from=int(left["rules_version"]),
             rules_version_to=int(right["rules_version"]),
             rules_fingerprint_from=left["rules_fingerprint"],
             rules_fingerprint_to=right["rules_fingerprint"],
+            scope_fingerprint_from=left.get("scope_fingerprint", ""),
+            scope_fingerprint_to=right.get("scope_fingerprint", ""),
             source_fingerprint_from=left["source_fingerprint"],
             source_fingerprint_to=right["source_fingerprint"],
             output_fingerprint_from=left["output_fingerprint"],
@@ -450,12 +717,16 @@ class Exporter:
                 "source_equal_previous": (
                     prev is not None and entry["source_fingerprint"] == prev["source_fingerprint"]
                 ),
+                "scope_equal_previous": (
+                    prev is not None
+                    and entry.get("scope_fingerprint", "") == prev.get("scope_fingerprint", "")
+                ),
                 "output_equal_previous": (
                     prev is not None and entry["output_fingerprint"] == prev["output_fingerprint"]
                 ),
                 "same_execution_as_previous": (
                     prev is not None
-                    and int(entry["rules_version"]) == int(prev["rules_version"])
+                    and entry.get("plan_fingerprint", "") == prev.get("plan_fingerprint", "")
                     and entry["source_fingerprint"] == prev["source_fingerprint"]
                 ),
                 "content_reused_from": reused_from,

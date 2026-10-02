@@ -10,6 +10,8 @@ from crp.audit import cross_table_consistency, scan_leaks
 from crp.batch import BatchStore
 from crp.exporter import Exporter
 from crp.paths import Store
+from crp.pseudonym import SubjectMapping
+from crp.scope import Scope
 from crp.util import read_csv, read_json
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +32,25 @@ def exporter(workspace: Store) -> Exporter:
 
 def _table(result, name: str):
     return read_csv(result.version_dir / f"{name}.csv")
+
+
+def _basis(result):
+    import json
+    return [
+        json.loads(line)
+        for line in (result.version_dir / "basis.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+
+
+def _basis_by_key(exporter, result, table, raw_key):
+    mapping = SubjectMapping.load_or_create(exporter.store, BATCH)
+    ref = mapping.record_ref(table, raw_key)
+    for payload in _basis(result):
+        if payload["table"] == table and payload["record_key"] == ref:
+            return payload
+    raise KeyError(f"{table}:{raw_key}")
 
 
 def test_export_removes_direct_identifiers(exporter):
@@ -326,3 +347,179 @@ def test_migrated_history_rebuilds_index_from_version_dirs(workspace, exporter):
     comparison = exporter.compare_versions(BATCH, first.version, second.version)
     assert comparison.rules_changed is True
     assert comparison.output_equal is False
+
+def test_scoped_revision_only_affects_previewed_records(workspace, exporter):
+    """范围化修订：预览命中记录，范围内用新规则，范围外沿用旧规则，逐条可溯。"""
+    exporter.export_batch(BATCH, note="v1 执行")
+    scope_raw = read_json(ROOT / "configs" / "study001_scope_v3_labs_2024.json")
+    rules_raw = read_json(ROOT / "configs" / "study001_rules_v3_scoped.json")
+    BatchStore(workspace).update_rules(
+        BATCH, rules_raw, note="v2：仅 2024-02 起 labs 删除备注",
+        scope=Scope.parse(scope_raw),
+    )
+
+    preview = exporter.preview_scope(BATCH, 2)
+    labs_preview = [row for row in preview if row.table == "labs"]
+    assert {row.record_key for row in labs_preview if row.matched} == {
+        "PT001|V002|LDL", "PT003|V001|WBC", "PT003|V002|WBC"
+    }
+    assert all(row.matched_by.startswith("out_of_scope:continues_v") for row in labs_preview if not row.matched)
+
+    result = exporter.export_batch(BATCH, note="v2 范围执行")
+    assert result.reused is False
+    labs = _table(result, "labs")
+    wbc = next(row for row in labs if row["test_code"] == "WBC")
+    assert wbc["remark"] == ""
+    hba1c = next(row for row in labs if row["test_code"] == "HBA1C")
+    assert "lina.example@example.com" not in hba1c["remark"]
+    wbc_basis = _basis_by_key(exporter, result, "labs", "PT003|V001|WBC")
+    assert wbc_basis["rules_version"] == 2
+    assert wbc_basis["matched_by"].startswith("date_range:labs:")
+    assert wbc_basis["actions"]["remark"] == "drop"
+    assert wbc_basis["date_shift_fields"] == ["collected_at"]
+    ldl = _basis_by_key(exporter, result, "labs", "PT001|V001|LDL")
+    assert ldl["rules_version"] == 1 and ldl["matched_by"] == "all"
+    basis = _basis(result)
+    assert {b["rules_version"] for b in basis if b["table"] == "demographics"} == {1}
+    basis_text = (result.version_dir / "basis.jsonl").read_text(encoding="utf-8")
+    assert "PT001" not in basis_text and "PT002" not in basis_text
+    assert scan_leaks(exporter.store, BATCH, result.version) == []
+
+
+def test_scope_expansion_and_shrinkage_are_separate_executions(workspace, exporter):
+    """同样规则内容，范围扩大/缩小分别形成新执行；比较分别报告内容与范围变化。"""
+    first = exporter.export_batch(BATCH, note="v1 执行")
+    rules_raw = read_json(ROOT / "configs" / "study001_rules_v3_scoped.json")
+    BatchStore(workspace).update_rules(
+        BATCH, rules_raw, note="v2：范围 labs", scope=Scope.parse({"tables": ["labs"]})
+    )
+    second = exporter.export_batch(BATCH, note="v2 执行")
+    BatchStore(workspace).update_rules(
+        BATCH, rules_raw, note="v3：范围扩大到 visits",
+        scope=Scope.parse({"tables": ["labs", "visits"]}),
+    )
+    third = exporter.export_batch(BATCH, note="v3 执行")
+    BatchStore(workspace).update_rules(
+        BATCH, rules_raw, note="v4：范围缩回 labs",
+        scope=Scope.parse({"tables": ["labs"]}),
+    )
+    fourth = exporter.export_batch(BATCH, note="v4 执行")
+
+    assert [r.version for r in (first, second, third, fourth)] == [1, 2, 3, 4]
+    manifests = [read_json(r.version_dir / "manifest.json") for r in (second, third, fourth)]
+    assert manifests[0]["rules_fingerprint"] == manifests[1]["rules_fingerprint"] == manifests[2]["rules_fingerprint"]
+    assert manifests[0]["scope_fingerprint"] != manifests[1]["scope_fingerprint"]
+    assert manifests[1]["scope_fingerprint"] != manifests[2]["scope_fingerprint"]
+    assert manifests[0]["plan_fingerprint"] != manifests[2]["plan_fingerprint"]
+
+    cmp_23 = exporter.compare_versions(BATCH, 2, 3)
+    assert cmp_23.rules_changed is False and cmp_23.scope_changed is True
+    cmp_24 = exporter.compare_versions(BATCH, 2, 4)
+    assert cmp_24.scope_changed is True and cmp_24.same_execution is False
+
+    trail = exporter.rule_trail(BATCH)
+    assert [item["version"] for item in trail] == [1, 2, 3, 4]
+    assert trail[3]["scope_equal_previous"] is False
+
+
+def test_reverted_rule_content_with_different_scope_keeps_decision(workspace, exporter):
+    """规则内容退回早期配置但适用对象不同：保留新决定，不因配置相同合并身份。"""
+    first = exporter.export_batch(BATCH, note="v1 执行")
+    BatchStore(workspace).update_rules(
+        BATCH, read_json(ROOT / "configs" / "study001_rules_v2.json"), note="v2 修订"
+    )
+    second = exporter.export_batch(BATCH, note="v2 执行")
+    BatchStore(workspace).update_rules(
+        BATCH, read_json(ROOT / "configs" / "study001.json")["rules"],
+        note="v3：v1 内容但仅用药表",
+        scope=Scope.parse({"tables": ["medications"]}),
+    )
+    third = exporter.export_batch(BATCH, note="v3 执行")
+
+    assert third.reused is False and third.version == 3
+    m1 = read_json(first.version_dir / "manifest.json")
+    m3 = read_json(third.version_dir / "manifest.json")
+    # 用药表的规则内容退回 v1，但其它表沿用 v2：整体规则内容集合不同；
+    # 身份独立由 plan 指纹保证，不因部分内容相同而合并。
+    assert m3["plan_fingerprint"] != m1["plan_fingerprint"]
+
+    basis = _basis(third)
+    assert {b["rules_version"] for b in basis if b["table"] == "medications"} == {3}
+    assert {b["rules_version"] for b in basis if b["table"] != "medications"} == {2}
+    meds = _table(third, "medications")
+    assert meds[0]["start_date"] == "2024-01-09"
+    assert "note" not in _table(third, "demographics")[0]
+    cmp_13 = exporter.compare_versions(BATCH, 1, 3)
+    assert cmp_13.rules_changed is True
+    assert cmp_13.scope_changed is True
+    assert cmp_13.same_execution is False
+
+
+def test_new_source_record_is_judged_against_current_scope(workspace, exporter):
+    """来源新增记录：按当时范围重新判断，不借用另一批结论。"""
+    exporter.export_batch(BATCH, note="v1 执行")
+    BatchStore(workspace).update_rules(
+        BATCH, read_json(ROOT / "configs" / "study001_rules_v3_scoped.json"),
+        note="v2：仅 labs 删备注", scope=Scope.parse({"tables": ["labs"]}),
+    )
+    exporter.export_batch(BATCH, note="v2 执行")
+    demographics = workspace.raw_dir(BATCH) / "demographics.csv"
+    with demographics.open("a", encoding="utf-8", newline="") as fh:
+        fh.write("PT004,陈晨,310104200101041234,13000000004,2001-01-04,女,"
+                 "上海市浦东新区世纪大道100号,随访电话13000000004\n")
+    third = exporter.export_batch(BATCH, note="v3：新增 PT004")
+
+    mapping = read_json(exporter.store.private_dir(BATCH) / "mapping.json")
+    pt004_pseudo = mapping["pseudonyms"]["PT004"]
+    demo_basis = [b for b in _basis(third) if b["table"] == "demographics"]
+    pt004_basis = next(b for b in demo_basis if b["subject_id"] == pt004_pseudo)
+    assert pt004_basis["rules_version"] == 1
+    demo = _table(third, "demographics")
+    assert "note" in demo[0]
+    pt004_row = next(row for row in demo if row["subject_id"] == pt004_pseudo)
+    assert "[REDACTED]" in pt004_row["note"]
+    assert scan_leaks(exporter.store, BATCH, third.version) == []
+
+
+def test_explicit_record_scope_and_invalid_scope_rejected(workspace, exporter):
+    exporter.export_batch(BATCH, note="v1 执行")
+    BatchStore(workspace).update_rules(
+        BATCH, read_json(ROOT / "configs" / "study001_rules_v3_scoped.json"),
+        note="v2：明确集合",
+        scope=Scope.parse(read_json(ROOT / "configs" / "study001_scope_explicit_visits.json")),
+    )
+    result = exporter.export_batch(BATCH, note="v2 执行")
+    visit_basis = [b for b in _basis(result) if b["table"] == "visits"]
+    explicit = [b for b in visit_basis if b["matched_by"].startswith("record:")]
+    assert len(explicit) == 1
+    assert {b["rules_version"] for b in visit_basis if not b["matched_by"].startswith("record:")} == {1}
+
+    with pytest.raises(ValueError, match="不存在"):
+        BatchStore(workspace).update_rules(
+            BATCH, read_json(ROOT / "configs" / "study001.json")["rules"],
+            note="v3：错误集合",
+            scope=Scope.parse({"records": {"labs": ["NOT-EXIST"]}}),
+        )
+
+
+def test_basis_survives_retry_and_migration(workspace, exporter):
+    """增量重试与迁移历史后，日期处理与公开结果仍逐条可追溯。"""
+    first = exporter.export_batch(BATCH, note="v1 执行")
+    BatchStore(workspace).update_rules(
+        BATCH, read_json(ROOT / "configs" / "study001_rules_v3_scoped.json"),
+        note="v2：范围 labs", scope=Scope.parse({"tables": ["labs"]}),
+    )
+    second = exporter.export_batch(BATCH, note="v2 执行")
+    basis_before = (second.version_dir / "basis.jsonl").read_bytes()
+    retry = exporter.export_batch(BATCH, note="重试不改写")
+    assert retry.reused is True and retry.version == second.version
+    assert (second.version_dir / "basis.jsonl").read_bytes() == basis_before
+
+    exporter.store.export_index(BATCH).unlink()
+    rebuilt = exporter._load_index(BATCH)
+    assert [entry["version"] for entry in rebuilt["versions"]] == [1, 2]
+    assert rebuilt["versions"][1]["files"].get("basis.jsonl")
+    wbc = _basis_by_key(exporter, second, "labs", "PT003|V001|WBC")
+    assert wbc["date_shift_fields"] == ["collected_at"]
+    assert wbc["rules_version"] == 2
+    assert first.version_dir.exists()

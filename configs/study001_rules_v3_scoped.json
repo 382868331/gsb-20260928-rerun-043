@@ -1,0 +1,22 @@
+{
+  "_comment": "v3 规则内容：用药日期不再平移（退回 v1 配置），但修订仅在指定范围内生效。",
+  "demographics": [
+    {"field": "name", "action": "drop"},
+    {"field": "id_card", "action": "drop"},
+    {"field": "phone", "action": "drop"},
+    {"field": "address", "action": "drop"},
+    {"field": "birth_date", "action": "date_shift"},
+    {"field": "note", "action": "redact_text"}
+  ],
+  "visits": [
+    {"field": "visit_date", "action": "date_shift"},
+    {"field": "chief_complaint", "action": "redact_text"}
+  ],
+  "labs": [
+    {"field": "collected_at", "action": "date_shift"},
+    {"field": "remark", "action": "drop"}
+  ],
+  "medications": [
+    {"field": "note", "action": "redact_text"}
+  ]
+}

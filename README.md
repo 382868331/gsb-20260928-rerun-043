@@ -41,6 +41,15 @@ python -m crp update-rules STUDY-001 --rules configs/study001_rules_v2.json \
 python -m crp export STUDY-001 --note 'v2：删除人口学备注并补充用药日期平移'
 python -m crp versions STUDY-001
 
+# 一次规则修订只对指定资料范围生效：先预览，再导出
+# 范围支持来源表（tables）、时间区间（date_range）与明确资料集合（records），三者取并集
+python -m crp update-rules STUDY-001 \
+    --rules configs/study001_rules_v3_scoped.json \
+    --scope configs/study001_scope_v3_labs_2024.json \
+    --note 'v2：仅 2024-02 起 labs 删除备注'
+python -m crp preview-scope STUDY-001 2
+python -m crp export STUDY-001 --note 'v2：范围化修订导出'
+
 # 比较两次导出在规则、输入数据、最终内容三个维度上的变化
 python -m crp compare STUDY-001 1 2
 
@@ -67,6 +76,17 @@ python -m crp rule-trail STUDY-001
   **属于同一次执行**（规则修订号与输入均一致，即幂等重跑），同时列出新增/删除/内容变化的文件；
 - `rule-trail` 沿规则修订顺序列出全部执行，逐条标注「规则配置退回/重复」「公开输出与上一版相同」
   「同一次执行重跑」与「内容复用自 v00N」；
+- **范围化规则修订**：每次修订携带自己的适用范围（来源表/时间区间/明确资料集合），
+  导出时逐条记录沿修订序列判定生效版本——范围内采用新规则，范围外继续沿用更早的有效规则；
+  范围扩大或缩小都产生**新的执行**，不改写旧执行的采用范围；规则内容退回早期配置但适用
+  对象不同时，仍保留为独立决定，绝不因输出相同合并身份。来源新增记录在执行时重新判断是否
+  落入当时范围，不借用另一批结论；
+- **逐条公开溯源**：每个版本目录含 basis.jsonl，每条记录写明采用的规则修订号、修订说明、
+  范围命中依据（all/table/date_range/record/out_of_scope:continues_vN）、逐字段动作与
+  按人固定日期平移字段；记录键与受试者号均为不可逆派生引用，不含真实标识，泄露自检会扫描该文件；
+  增量重试复用同一执行并校验字节；迁移丢失索引后从版本目录重建，日期处理与公开结果仍逐条可追溯；
+- compare vA vB 额外分别报告**规则内容变化**与**适用范围变化**
+  （scope_fingerprint 与 plan_fingerprint 写入 manifest/index），互不代替。
 - `verify` 检查直接标识列、真实受试者号、人工敏感片段、敏感模式，并列出跨表关联到同一伪名的记录。
 
 ## 路线图

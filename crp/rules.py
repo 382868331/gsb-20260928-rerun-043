@@ -44,6 +44,8 @@ class FieldRule:
 def parse_rules(raw_rules: dict[str, list[dict[str, Any]]]) -> dict[str, list[FieldRule]]:
     parsed: dict[str, list[FieldRule]] = {}
     for table, rules in (raw_rules or {}).items():
+        if str(table).startswith("_"):
+            continue
         seen: set[str] = set()
         table_rules: list[FieldRule] = []
         for item in rules:

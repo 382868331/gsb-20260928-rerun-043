@@ -1,0 +1,6 @@
+{
+  "_comment": "v3 修订的适用范围：仅 labs 表 2024-02-01（含）之后的记录采用新规则；范围外继续沿用旧规则。",
+  "date_range": {
+    "labs": {"field": "collected_at", "start": "2024-02-01", "end": ""}
+  }
+}

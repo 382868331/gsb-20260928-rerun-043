@@ -95,3 +95,12 @@ class SubjectMapping:
 
     def offset_for(self, subject_id: str) -> int:
         return self.register(subject_id)[1]
+
+    def record_ref(self, table: str, record_key: str) -> str:
+        """公开溯源用的稳定记录引用：不可逆，但跨执行保持一致，可逐条对照。"""
+        digest = hmac.new(
+            self.secret.encode("utf-8"),
+            f"record|{self.batch_id}|{table}|{record_key}".encode("utf-8"),
+            hashlib.sha256,
+        )
+        return "R" + digest.hexdigest()[:16].upper()
