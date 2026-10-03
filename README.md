@@ -49,6 +49,21 @@ python -m crp compare STUDY-001 1 2
 
 # 沿规则修订顺序查看每次执行：标注配置相同/输出相同/同一次执行重跑/内容复用
 python -m crp rule-trail STUDY-001
+
+# 按接收者核对多次交付合在一起会公开什么（联合披露预览）
+python -m crp register-recipient STUDY-001 REC-A --name '某医院科研科'
+# request 声明冻结的导出版本与本次申请的记录（record_id 取自 rule_trace.csv）
+python -m crp disclosure-preview STUDY-001 REC-A \
+    --request-json '{"version":1,"records":[{"table":"labs","record_id":"labs:visit_id=V001;test_code=LDL"}]}' \
+    --output preview.json
+python -m crp confirm-disclosure STUDY-001 REC-A --preview preview.json --plan as_requested --note '第一次：检验'
+# 政策修订（禁止字段/字段组合）只约束今后的新交付，历史交付不改写
+python -m crp revise-policy STUDY-001 \
+    --rules-json '{"forbid_combinations":[{"fields":["visit_date","department"]}]}' --note '禁止日期+科室'
+# 接收者授权缩小同样只影响此后的交付
+python -m crp narrow-authorization STUDY-001 REC-A \
+    --scope-json '{"sources":["labs"]}' --note '缩小到检验来源'
+python -m crp deliveries STUDY-001 REC-A
 ```
 
 默认数据根目录为 `./data`，可用全局参数 `--data-root` 修改。
@@ -74,6 +89,31 @@ python -m crp rule-trail STUDY-001
 - `rule-trail` 沿规则修订顺序列出全部执行，逐条标注「规则配置退回/重复」「公开输出与上一版相同」
   「同一次执行重跑」与「内容复用自 v00N」；
 - `verify` 检查直接标识列、真实受试者号、人工敏感片段、敏感模式，并列出跨表关联到同一伪名的记录。
+
+## 按接收者的联合披露核对
+
+去标识导出版本是面向所有接收者的候选公开结果；`crp/disclosure.py` 在其上增加「接收者维度」：
+
+- **接收者档案与授权修订**（`disclosure/<batch>/recipients/`）：每个接收者独立登记，授权范围
+  只增不改；后来缩小授权只影响之后的交付，之前收到什么仍有准确记录；
+- **不可变对外材料**（`disclosure/<batch>/materials/Mxxxx/`）：由冻结的导出版本、记录选择、
+  日期精度与来源别名确定性派生（材料 ID 即其规格指纹）；保存或网络重试辨认出同一份材料时
+  复用同一 `material_id`，只累加 `attempts`，绝不重复计入披露；
+- **预览绑定身份**：每次预览绑定接收者、导出版本（资料身份）、授权修订、政策修订与
+  既有交付快照；预览生成后既有交付增加（或授权/政策/导出变化），确认时判为过期，必须重新核对；
+  确认时还要核对接收者与资料身份一致，不能拿 A 的预览向 B 交付；
+- **关联依据分级，不靠猜测**：逐条记录标注与既有交付的对应——`record_key`（业务记录键可确认，
+  来源改名时必须提供显式 `source_aliases` 才成立）、`subject`（业务键对不上但同一稳定伪名的
+  受试者级确定关联）、`unconfirmed`（来源改名且无别名等依据，记录级对应只标注、不参与新增组合计算）；
+  同一记录在新导出版本中再次出现、字段经过不同变换（如更细日期精度）都会如实列出；
+- **新增公开内容**：逐字段标注是否首次可被该接收者关联到（`newly_linkable`）、日期精度是否
+  较既往升级，并汇总跨既有交付的 `new_combination`；
+- **四种方案对比**：`as_requested`（全部，撞政策时确认被拦截）、`allow_only`（剔除授权外/政策禁止
+  的字段或记录）、`reduce_precision`（日期降至月，重新计算仍成立的组合）、`cancel`（不形成材料），
+  每种方案各自列出仍会新增的可关联内容与采用规则；
+- **内外有别**：`audit_note` 等内部审计说明（可含真实编号）只写入内部交付登记
+  `disclosure/<batch>/deliveries/<recipient>.json`，绝不进入对外材料目录；材料目录整体经过
+  真实编号、人工敏感片段与内置敏感模式扫描（`scan_material_leaks`）。
 
 ## 路线图
 
