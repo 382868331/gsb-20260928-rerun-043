@@ -10,6 +10,7 @@
 - `crp/redact.py`：内置敏感模式 + `manual_sensitive.json` 人工标注片段脱敏；
 - `crp/exporter.py`：按规则去标识并生成不可变导出版本；
 - `crp/audit.py`：泄露扫描与跨表受试者引用一致性核对；
+- `crp/disclosure.py`：按接收者登记授权与交付，预览多次交付合在一起的联合披露；
 - `data/raw/STUDY-001/`：完全虚构的人口学、访视、检验、用药四类记录；
 - `configs/`：批次配置与第二版字段规则示例。
 
@@ -74,6 +75,22 @@ python -m crp rule-trail STUDY-001
 - `rule-trail` 沿规则修订顺序列出全部执行，逐条标注「规则配置退回/重复」「公开输出与上一版相同」
   「同一次执行重跑」与「内容复用自 v00N」；
 - `verify` 检查直接标识列、真实受试者号、人工敏感片段、敏感模式，并列出跨表关联到同一伪名的记录。
+
+## 按接收者的联合披露预览
+
+导出版本是面向所有接收者的候选公开结果；真正发给谁、发过什么，在 `disclosure.py` 这一层按
+**接收者**单独记账，核心原则是「不能只看本次文件，要核对同一接收者多次交付合在一起会公开什么」：
+
+- **绑定身份**：每份预览绑定明确的接收者、冻结的导出版本（资料身份）和该接收者当时的既有交付范围；确认时若接收者不符直接拒绝；
+- **关联依据有据可查**：本次每条记录都会列出能对应到的既有交付，依据分为 `record_key`（业务记录键加伪名可确认）、`subject`（同一稳定伪名的受试者级关联）与 `unconfirmed`（来源改名且未用 `source_aliases` 声明显式别名，记录级对应缺少依据）；缺少依据的对应只列出、不参与新增组合计算，绝不靠猜测补出记录关系；
+- **新增可关联组合**：逐字段标注既往是否已对该受试者公开、日期是否从月升级到日，并列出本次记录与既往记录合在一起后新能关联出的字段组合（`new_combination`、`new_field`、`subject_links`）；
+- **政策只管今后**：`revise-policy` 可声明 `forbid_fields` 与 `forbid_combinations`，禁止此后新增的字段或字段组合，但历史交付登记与材料永不改写；接收者用 `narrow-authorization` 追加授权修订（通常缩小范围），也只影响之后的交付；
+- **三种可比方案**：预览同时给出 `as_requested`（全量，撞政策直接拒绝确认）、`allow_only`（仅交付授权与政策允许的部分，剔除受限字段或记录）、`reduce_precision`（日期统一降至月精度）与 `cancel`（取消），每个方案都列出仍会新增的可关联内容、阻止项及采用的授权/政策修订号；
+- **过期不可提交**：预览带快照（授权修订、政策修订、导出版本指纹、既有交付清单）。确认前若既有交付增加（或授权/政策/导出版本变化），确认被拒绝，必须重新核对后再提交；
+- **同一份材料不重复计入**：对外材料由「导出版本、记录选择、日期精度、来源别名或改名」确定性派生材料 ID；保存与重试若形成同一份对外材料（字节一致），复用材料目录、交付登记只增加 `attempts`，不会重复计入披露；
+- **审计说明与公开结果分离**：`audit_note` 只写入内部交付登记（`data/disclosure/<batch>/deliveries/`），材料目录（`materials/`）整体经过与导出同级的泄露扫描，真实编号、人工敏感片段、证件/手机/邮箱模式都不能因为「保留审计说明」进入公开结果。
+
+相关命令：`register-recipient`、`narrow-authorization`、`revise-policy`、`disclosure-preview`（可用 `--output` 保存带快照的预览 JSON）、`confirm-disclosure`（`--plan` 取 `as_requested`、`allow_only`、`reduce_precision`、`cancel`）、`deliveries`。`disclosure-preview` 的请求 JSON 形如 `{"version":1,"records":[{"table":"labs","record_id":"labs:visit_id=V001;test_code=LDL"}],"source_names":{"labs":"laboratory_results"},"source_aliases":{"labs":"labs"}}`；来源改名时只有在 `source_aliases` 中显式声明，记录级对应才被视为可确认。
 
 ## 路线图
 

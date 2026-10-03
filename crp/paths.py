@@ -40,3 +40,22 @@ class Store:
 
     def export_index(self, batch_id: str) -> Path:
         return self.export_dir(batch_id) / "index.json"
+
+    def disclosure_dir(self, batch_id: str) -> Path:
+        """按接收者组织的多次交付与对外材料根目录。"""
+        return self.root / "disclosure" / batch_id
+
+    def recipient_file(self, batch_id: str, recipient_id: str) -> Path:
+        return self.disclosure_dir(batch_id) / "recipients" / f"{recipient_id}.json"
+
+    def recipients_index(self, batch_id: str) -> Path:
+        return self.disclosure_dir(batch_id) / "recipients" / "index.json"
+
+    def policy_file(self, batch_id: str) -> Path:
+        return self.disclosure_dir(batch_id) / "policy.json"
+
+    def deliveries_index(self, batch_id: str, recipient_id: str) -> Path:
+        return self.disclosure_dir(batch_id) / "deliveries" / f"{recipient_id}.json"
+
+    def material_dir(self, batch_id: str, material_id: str) -> Path:
+        return self.disclosure_dir(batch_id) / "materials" / material_id

@@ -8,9 +8,22 @@ from pathlib import Path
 
 from crp.audit import cross_table_consistency, scan_leaks
 from crp.batch import BatchStore
+from crp.disclosure import (
+    DisclosurePlanner,
+    DisclosurePolicy,
+    DisclosurePolicyError,
+    RecipientStore,
+    StalePreviewError,
+)
 from crp.exporter import Exporter
 from crp.paths import Store
 from crp.util import read_json
+
+
+def _json_arg(file_arg: str | None, inline_arg: str | None) -> dict:
+    if file_arg:
+        return read_json(Path(file_arg))
+    return json.loads(inline_arg)
 
 
 def _store(args: argparse.Namespace) -> Store:
@@ -131,6 +144,87 @@ def cmd_rule_trail(args: argparse.Namespace) -> None:
         )
 
 
+def cmd_recipient_register(args: argparse.Namespace) -> None:
+    authorization = _json_arg(args.scope, args.scope_json) if (args.scope or args.scope_json) else None
+    recipient = RecipientStore(_store(args)).register(
+        args.batch_id, args.recipient_id, name=args.name,
+        authorization=authorization, note=args.note,
+    )
+    print(f"已登记接收者 {recipient.recipient_id}（{recipient.name}），授权修订 v{recipient.authorization_revision}")
+
+
+def cmd_recipient_narrow(args: argparse.Namespace) -> None:
+    scope = _json_arg(args.scope, args.scope_json)
+    recipient = RecipientStore(_store(args)).narrow_authorization(
+        args.batch_id, args.recipient_id, scope, note=args.note,
+    )
+    print(
+        f"接收者 {recipient.recipient_id} 授权已追加修订 v{recipient.authorization_revision}；"
+        "历史授权与已交付记录保持不变"
+    )
+
+
+def cmd_policy_revise(args: argparse.Namespace) -> None:
+    rules = _json_arg(args.rules, args.rules_json)
+    revision = DisclosurePolicy(_store(args), args.batch_id).revise(rules, note=args.note)
+    print(f"披露政策已修订至 v{revision['revision']}：{args.note}（仅影响此后新交付）")
+
+
+def cmd_disclosure_preview(args: argparse.Namespace) -> None:
+    request = _json_arg(args.request, args.request_json)
+    preview = DisclosurePlanner(_store(args)).preview(args.batch_id, args.recipient_id, request)
+    if args.output:
+        Path(args.output).write_text(json.dumps(preview, ensure_ascii=False, indent=2) + "\n",
+                                      encoding="utf-8")
+    print(
+        f"接收者 {args.recipient_id} 联合披露预览：绑定导出版本 v{preview['request_version']}，"
+        f"授权 v{preview['authorization_revision']}，政策 v{preview['policy_revision']}，"
+        f"既有交付 {len(preview['prior_deliveries'])} 次"
+    )
+    for name, plan in preview["plans"].items():
+        print(f"  [{name}] {plan['description']}")
+        print(f"    交付 {len(plan['included_records'])} 条；新增可关联内容 {len(plan['new_disclosures'])} 项；"
+              f"受限/阻止 {len(plan['blocked'])} 项")
+        for item in plan["blocked"]:
+            detail = item.get("field") or item.get("record_id", "")
+            print(f"      阻止: {item['kind']} {item.get('table', '')}:{detail}")
+    if args.output:
+        print(f"预览快照已写入 {args.output}（确认时必须回传同一份，过期需重新核对）")
+
+
+def cmd_disclosure_confirm(args: argparse.Namespace) -> None:
+    preview = read_json(Path(args.preview))
+    try:
+        result = DisclosurePlanner(_store(args)).confirm(
+            args.batch_id, args.recipient_id, preview, args.plan,
+            note=args.note, audit_note=args.audit_note or "",
+        )
+    except (StalePreviewError, DisclosurePolicyError, ValueError) as exc:
+        raise SystemExit(str(exc))
+    if result["cancelled"]:
+        print("已取消本次交付，未形成任何对外材料")
+        return
+    reused = "（同一份对外材料，未重复计入披露）" if result["delivery_reused"] else ""
+    print(
+        f"已登记交付 {result['delivery_id']}：材料 {result['material_id']}{reused}；"
+        f"新增可关联内容 {len(result['new_disclosures'])} 项"
+    )
+
+
+def cmd_deliveries(args: argparse.Namespace) -> None:
+    from crp.disclosure import DeliveryRegistry
+    deliveries = DeliveryRegistry(_store(args)).deliveries(args.batch_id, args.recipient_id)
+    if not deliveries:
+        print(f"接收者 {args.recipient_id} 暂无交付记录")
+        return
+    print(f"接收者 {args.recipient_id} 的既有交付：")
+    for item in deliveries:
+        print(
+            f"  {item['delivery_id']} 材料 {item['material_id']} 时间 {item['created_at']} "
+            f"授权v{item['authorization_revision']} 政策v{item['policy_revision']} {item['note']}"
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="crp", description="临床研究数据平台：虚构资料去标识导出")
     parser.add_argument("--data-root", default="data", help="数据根目录（默认 ./data）")
@@ -170,6 +264,53 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("rule-trail", help="沿规则修订顺序查看每次执行与复用关系")
     p.add_argument("batch_id")
     p.set_defaults(func=cmd_rule_trail)
+
+    p = sub.add_parser("register-recipient", help="登记资料接收者与初始授权范围")
+    p.add_argument("batch_id")
+    p.add_argument("recipient_id")
+    p.add_argument("--name", default="")
+    p.add_argument("--scope")
+    p.add_argument("--scope-json")
+    p.add_argument("--note", default="初始授权")
+    p.set_defaults(func=cmd_recipient_register)
+
+    p = sub.add_parser("narrow-authorization", help="追加接收者授权修订（通常缩小范围）")
+    p.add_argument("batch_id")
+    p.add_argument("recipient_id")
+    p.add_argument("--scope", required=True)
+    p.add_argument("--scope-json")
+    p.add_argument("--note", required=True)
+    p.set_defaults(func=cmd_recipient_narrow)
+
+    p = sub.add_parser("revise-policy", help="修订披露政策（禁止字段/字段组合，仅影响今后）")
+    p.add_argument("batch_id")
+    p.add_argument("--rules")
+    p.add_argument("--rules-json")
+    p.add_argument("--note", required=True)
+    p.set_defaults(func=cmd_policy_revise)
+
+    p = sub.add_parser("disclosure-preview", help="按接收者核对多次交付合在一起会公开什么")
+    p.add_argument("batch_id")
+    p.add_argument("recipient_id")
+    p.add_argument("--request")
+    p.add_argument("--request-json", required=True)
+    p.add_argument("--output", help="把含快照的完整预览写入 JSON 文件，供 confirm 回传")
+    p.set_defaults(func=cmd_disclosure_preview)
+
+    p = sub.add_parser("confirm-disclosure", help="依据未过期预览形成对外材料并登记交付")
+    p.add_argument("batch_id")
+    p.add_argument("recipient_id")
+    p.add_argument("--preview", required=True)
+    p.add_argument("--plan", required=True,
+                   choices=["as_requested", "allow_only", "reduce_precision", "cancel"])
+    p.add_argument("--note", default="")
+    p.add_argument("--audit-note", default="")
+    p.set_defaults(func=cmd_disclosure_confirm)
+
+    p = sub.add_parser("deliveries", help="列出接收者的既有交付记录")
+    p.add_argument("batch_id")
+    p.add_argument("recipient_id")
+    p.set_defaults(func=cmd_deliveries)
     return parser
 
 
