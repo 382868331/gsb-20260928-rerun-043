@@ -9,8 +9,11 @@ from pathlib import Path
 from crp.audit import cross_table_consistency, scan_leaks
 from crp.batch import BatchStore
 from crp.disclosure import (
+    DeliveryRegistry,
     DisclosurePlanner,
     DisclosurePolicy,
+    PendingApplicationNotFoundError,
+    PendingApplicationStore,
     RecipientStore,
     StalePreviewError,
 )
@@ -177,15 +180,23 @@ def cmd_disclosure_preview(args: argparse.Namespace) -> None:
     if not args.request and not args.request_json:
         raise SystemExit("必须通过 --request 或 --request-json 提供本次资料申请")
     request = _json_arg(args.request, args.request_json)
-    preview = DisclosurePlanner(_store(args)).preview(args.batch_id, args.recipient_id, request)
+    if args.application_id:
+        request = dict(request)
+        request["application_id"] = args.application_id
+    preview = DisclosurePlanner(_store(args)).preview(
+        args.batch_id, args.recipient_id, request, save=args.save,
+    )
     if args.output:
         Path(args.output).write_text(json.dumps(preview, ensure_ascii=False, indent=2) + "\n",
                                       encoding="utf-8")
     print(
         f"接收者 {args.recipient_id} 联合披露预览：绑定导出版本 v{preview['request_version']}，"
         f"授权 v{preview['authorization_revision']}，政策 v{preview['policy_revision']}，"
-        f"既有交付 {len(preview['prior_deliveries'])} 次"
+        f"既有交付 {len(preview['prior_deliveries'])} 次，"
+        f"同接收方待审申请 {len(preview['peer_pending'])} 份"
     )
+    if preview["application_id"]:
+        print(f"  申请号 {preview['application_id']}：已保存为待审申请，确认或取消前一直有效")
     for name, plan in preview["plans"].items():
         print(f"  [{name}] {plan['description']}")
         print(f"    交付 {len(plan['included_records'])} 条；新增可关联内容 {len(plan['new_disclosures'])} 项；"
@@ -206,14 +217,33 @@ def cmd_disclosure_confirm(args: argparse.Namespace) -> None:
         )
     except StalePreviewError as exc:
         raise SystemExit(str(exc))
+    except PendingApplicationNotFoundError as exc:
+        raise SystemExit(f"待审申请已处理或不存在，必须重新预览后再确认：{exc}")
     if result["cancelled"]:
-        print("已取消本次交付，未形成任何对外材料")
+        print("已取消本次交付：未形成任何对外材料，未登记交付，待审申请已移除")
         return
     reused = "（同一份对外材料，未重复计入披露）" if result["delivery_reused"] else ""
     print(
         f"已登记交付 {result['delivery_id']}：材料 {result['material_id']}{reused}；"
         f"新增可关联内容 {len(result['new_disclosures'])} 项"
     )
+
+
+def cmd_pending_list(args: argparse.Namespace) -> None:
+    store = _store(args)
+    entries = PendingApplicationStore(store).list(args.batch_id, args.recipient_id)
+    if not entries:
+        print(f"接收者 {args.recipient_id} 暂无待审申请")
+        return
+    print(f"接收者 {args.recipient_id} 的待审申请（{len(entries)} 份，相互联合核对）：")
+    for entry in entries:
+        records = entry["request"].get("records", [])
+        tables = sorted({item["table"] for item in records})
+        print(
+            f"  {entry['application_id']} v{entry['request'].get('version')} "
+            f"日期精度 {entry['request'].get('date_precision', 'day')} "
+            f"来源 {','.join(tables) or '-'} 记录 {len(records)} 条 {entry.get('note', '')}"
+        )
 
 
 def cmd_deliveries(args: argparse.Namespace) -> None:
@@ -299,6 +329,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("recipient_id")
     p.add_argument("--request")
     p.add_argument("--request-json")
+    p.add_argument("--application-id", help="申请号：提供后该预览保存为该接收方的待审申请")
+    p.add_argument("--save", action="store_true",
+                   help="显式要求保存待审申请（与 --application-id 一起使用；提供申请号时默认即保存）")
     p.add_argument("--output", help="把含快照的完整预览写入 JSON 文件，供 confirm 回传")
     p.set_defaults(func=cmd_disclosure_preview)
 
@@ -311,6 +344,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note", default="")
     p.add_argument("--audit-note", default="")
     p.set_defaults(func=cmd_disclosure_confirm)
+
+    p = sub.add_parser("pending-applications", help="列出接收方当前同时待审、相互联合核对的申请")
+    p.add_argument("batch_id")
+    p.add_argument("recipient_id")
+    p.set_defaults(func=cmd_pending_list)
 
     p = sub.add_parser("deliveries", help="列出接收者的既有交付记录")
     p.add_argument("batch_id")

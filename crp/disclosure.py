@@ -80,6 +80,10 @@ class StalePreviewError(RuntimeError):
     """预览生成后既有交付/政策/授权/导出版本发生变化，必须重新核对。"""
 
 
+class PendingApplicationNotFoundError(FileNotFoundError):
+    """待审申请不存在（可能已确认、取消或从未保存）。"""
+
+
 class DisclosurePolicyError(ValueError):
     pass
 
@@ -600,6 +604,71 @@ class DeliveryRegistry:
         return entry
 
 
+class PendingApplicationStore:
+    """每个接收者一份只在「待审期间」存在的申请登记；确认/取消后移除。
+
+    待审申请按接收者隔离存放（``disclosure/<batch>/pending/<recipient>/``）：
+
+    - 预览生成时落盘，关闭流程、稍后重开仍可继续核对，不依赖内存状态；
+    - 取消（cancel 方案）不形成任何对外材料，申请一并移除，不留登记；
+    - 确认形成交付后移除；同一接收方此后再预览时它作为**既有交付**被计入；
+    - 不同接收者的待审申请互不可见，历史与联合核对严格隔离。
+    """
+
+    def __init__(self, store: Store) -> None:
+        self.store = store
+
+    def save(self, batch_id: str, recipient_id: str, application_id: str,
+             request: dict[str, Any], note: str = "") -> dict[str, Any]:
+        entry = {
+            "application_id": application_id,
+            "batch_id": batch_id,
+            "recipient_id": recipient_id,
+            "created_at": _now(),
+            "note": note,
+            "request": self._canonical_request(request),
+        }
+        write_json(
+            self.store.pending_file(batch_id, recipient_id, application_id), entry,
+        )
+        return entry
+
+    def load(self, batch_id: str, recipient_id: str, application_id: str) -> dict[str, Any]:
+        path = self.store.pending_file(batch_id, recipient_id, application_id)
+        if not path.exists():
+            raise PendingApplicationNotFoundError(f"待审申请不存在: {application_id}")
+        return read_json(path)
+
+    def list(self, batch_id: str, recipient_id: str,
+             exclude: str | None = None) -> list[dict[str, Any]]:
+        folder = self.store.pending_dir(batch_id, recipient_id)
+        if not folder.exists():
+            return []
+        entries = []
+        for path in sorted(folder.glob("*.json")):
+            entry = read_json(path)
+            if exclude is not None and entry["application_id"] == exclude:
+                continue
+            entries.append(entry)
+        return entries
+
+    def remove(self, batch_id: str, recipient_id: str, application_id: str) -> bool:
+        path = self.store.pending_file(batch_id, recipient_id, application_id)
+        if not path.exists():
+            return False
+        path.unlink()
+        return True
+
+    @staticmethod
+    def _canonical_request(request: dict[str, Any]) -> dict[str, Any]:
+        """剔除仅用于存储控制、不构成资料身份的键后规范化申请。"""
+        skip = {"application_id"}
+        return {str(key): value for key, value in sorted(request.items()) if key not in skip}
+
+    def request_fingerprint(self, entry: dict[str, Any]) -> str:
+        return sha256_text(stable_json(entry["request"]))
+
+
 @dataclass(frozen=True)
 class RecordLink:
     """一条本次记录与某份既有交付材料中记录的对应关系。
@@ -707,6 +776,7 @@ class DisclosurePlanner:
         self.store = store
         self.recipients = RecipientStore(store)
         self.registry = DeliveryRegistry(store)
+        self.pending = PendingApplicationStore(store)
         self.builder = MaterialBuilder(store)
 
     # ---- 既有交付快照 -------------------------------------------------
@@ -733,6 +803,15 @@ class DisclosurePlanner:
                     if "spec_fingerprint" in item else None,
                 }
                 for item in deliveries
+            ],
+            # 同一接收方同时待审的其他申请也是联合预览的一部分：任一份申请变化
+            # （新建、修改、确认、取消）都会使旧预览快照过期。
+            "pending_applications": [
+                {
+                    "application_id": item["application_id"],
+                    "request_fingerprint": self.pending.request_fingerprint(item),
+                }
+                for item in self.pending.list(batch_id, recipient_id)
             ],
         }
         return sha256_text(stable_json(summary))
@@ -761,8 +840,52 @@ class DisclosurePlanner:
                     "fields": set(row.keys()),
                     "values": dict(row),
                     "date_precision": trace.get("date_precision", "day"),
+                    "status": "delivered",
+                    "application_id": None,
                 })
         return prior
+
+    def _peer_pending_records(self, batch_id: str, recipient_id: str,
+                              exclude_application_id: str | None,
+                              precision_cap: str) -> list[dict[str, Any]]:
+        """同一接收方其他**待审**申请中拟交付的记录，按各自申请精度归一。
+
+        这些记录尚未实际交付，但联合预览必须把它们视为本次申请落地后
+        「同一接收者已经能够关联到」的内容；标记为 ``status=pending``，
+        与真正的既有交付（``status=delivered``）区分开。
+        """
+        peers: list[dict[str, Any]] = []
+        for entry in self.pending.list(batch_id, recipient_id, exclude=exclude_application_id):
+            request = entry["request"]
+            requested_precision = request.get("date_precision", "day")
+            effective_precision = requested_precision
+            if DATE_PRECISION_ORDER[effective_precision] > DATE_PRECISION_ORDER[precision_cap]:
+                effective_precision = precision_cap
+            for record in self._requested_records(batch_id, request):
+                values = {}
+                fields = []
+                for field_name in record["fields"]:
+                    value = record["values"].get(field_name, "")
+                    field_precision = date_precision_of(value)
+                    if field_precision is not None \
+                            and DATE_PRECISION_ORDER[field_precision] > DATE_PRECISION_ORDER[effective_precision]:
+                        value = truncate_date(value, effective_precision)
+                    fields.append(field_name)
+                    values[field_name] = value
+                peers.append({
+                    "delivery_id": f"PENDING:{entry['application_id']}",
+                    "material_id": None,
+                    "table": record["table"],
+                    "source_name": record["source_name"],
+                    "record_id": record["record_id"],
+                    "pseudonym": record["pseudonym"],
+                    "fields": set(fields),
+                    "values": values,
+                    "date_precision": effective_precision,
+                    "status": "pending",
+                    "application_id": entry["application_id"],
+                })
+        return peers
 
     # ---- 本次申请记录 -------------------------------------------------
 
@@ -841,7 +964,13 @@ class DisclosurePlanner:
     # ---- 预览 ---------------------------------------------------------
 
     def preview(self, batch_id: str, recipient_id: str,
-                request: dict[str, Any]) -> dict[str, Any]:
+                request: dict[str, Any], save: bool = False) -> dict[str, Any]:
+        """生成联合披露预览。
+
+        ``request`` 可包含 ``application_id``：带申请号的预览落盘为该接收者的
+        **待审申请**，同一接收方其他待审申请（本申请除外）一并进入联合核对，
+        关闭后重开仍在；不带申请号时为不落盘的临时预览，行为与旧版一致。
+        """
         recipient = self.recipients.load(batch_id, recipient_id)
         policy_payload = DisclosurePolicy(self.store, batch_id).load()
         policy_revision = int(policy_payload.get("revision", 0))
@@ -849,12 +978,26 @@ class DisclosurePlanner:
             "forbid_fields": [], "forbid_combinations": [],
         }
         authorization = recipient.current_authorization()
+        application_id = request.get("application_id")
+        if save and not application_id:
+            raise ValueError("保存待审申请时必须提供 application_id")
+        # 快照必须在申请落盘前取：其中的待审清单不包含本申请自身。
+        snapshot = self.snapshot(batch_id, recipient_id)
+        if application_id:
+            self.pending.save(batch_id, recipient_id, str(application_id), request,
+                              note=str(request.get("note", "")))
         requested = self._requested_records(batch_id, request)
         prior = self._prior_records(batch_id, recipient_id)
+        peers_day = self._peer_pending_records(
+            batch_id, recipient_id,
+            exclude_application_id=str(application_id) if application_id else None,
+            precision_cap="day",
+        )
+        joint_day = prior + peers_day
 
         previews: list[RecordPreview] = []
         for record in requested:
-            links, unconfirmed = self._links_for(record, prior)
+            links, unconfirmed = self._links_for(record, joint_day)
             allowed = authorization_allows(
                 authorization, record["table"], record["pseudonym"], record["record_id"]
             )
@@ -867,7 +1010,7 @@ class DisclosurePlanner:
                 links=links + unconfirmed,
             )
             # 受试者维度的既往字段史：只统计可确认关联（record_key/subject）。
-            subject_history = self._subject_field_history(prior, record["pseudonym"])
+            subject_history = self._subject_field_history(joint_day, record["pseudonym"])
             record_history = self._record_field_history(links, prior)
             for field_name in record["fields"]:
                 value = record["values"].get(field_name, "")
@@ -888,24 +1031,41 @@ class DisclosurePlanner:
                     precision_upgrade_from=upgrade_from,
                     first_delivered_by=first_by,
                 ))
-            preview.new_combinations = self._new_combinations(record, links, prior, "day")
+            preview.new_combinations = self._new_combinations(record, links, joint_day, "day")
             previews.append(preview)
 
         plans = {}
         for plan_name in ("as_requested", "allow_only", "reduce_precision", "cancel"):
             plans[plan_name] = self._evaluate_plan(
                 plan_name, previews, request, policy_rules, authorization,
-                policy_revision,
+                policy_revision, prior, peers_day, batch_id, recipient_id,
             ).to_dict()
 
         return {
             "batch_id": batch_id,
             "recipient_id": recipient_id,
             "recipient_name": recipient.name,
+            "application_id": str(application_id) if application_id else None,
+            "saved": bool(application_id),
             "authorization_revision": recipient.authorization_revision,
             "policy_revision": policy_revision,
             "request_version": int(request["version"]),
-            "snapshot": self.snapshot(batch_id, recipient_id),
+            "snapshot": snapshot,
+            "peer_pending": [
+                {
+                    "application_id": item["application_id"],
+                    "date_precision": item["date_precision"],
+                    "records": [
+                        {"table": record["table"], "record_id": record["record_id"]}
+                        for record in peers_day
+                        if record["application_id"] == item["application_id"]
+                    ],
+                }
+                for item in self.pending.list(
+                    batch_id, recipient_id,
+                    exclude=str(application_id) if application_id else None,
+                )
+            ],
             "prior_deliveries": [
                 {
                     "delivery_id": item["delivery_id"],
@@ -973,6 +1133,8 @@ class DisclosurePlanner:
             combos.append({
                 "kind": "record_link" if basis == "record_key" else "subject_link",
                 "basis": basis,
+                "status": item.get("status", "delivered"),
+                "application_id": item.get("application_id"),
                 "current_record": {"table": record["table"], "record_id": record["record_id"],
                                    "source_name": record["source_name"]},
                 "prior_record": {"delivery_id": item["delivery_id"], "material_id": item["material_id"],
@@ -996,7 +1158,9 @@ class DisclosurePlanner:
 
     def _evaluate_plan(self, plan_name: str, previews: list[RecordPreview],
                        request: dict[str, Any], policy_rules: dict[str, Any],
-                       authorization: dict[str, Any], policy_revision: int) -> PlanPreview:
+                       authorization: dict[str, Any], policy_revision: int,
+                       prior: list[dict[str, Any]], peers_day: list[dict[str, Any]],
+                       batch_id: str, recipient_id: str) -> PlanPreview:
         blocked: list[dict[str, Any]] = []
         included: list[RecordPreview] = []
         excluded: list[RecordPreview] = []
@@ -1013,7 +1177,14 @@ class DisclosurePlanner:
             )
 
         precision_cap = "month" if plan_name == "reduce_precision" else "day"
+        peers = self._peer_pending_records(
+            batch_id, recipient_id,
+            exclude_application_id=str(request.get("application_id"))
+            if request.get("application_id") else None,
+            precision_cap=precision_cap,
+        )
         include_fields: dict[str, list[str]] = {}
+        # 先做授权外剔除；通过的记录才进入「确认后将新增可关联内容」的联合计算。
         for preview in previews:
             if not preview.authorized:
                 excluded.append(preview)
@@ -1022,6 +1193,8 @@ class DisclosurePlanner:
                     "table": preview.table,
                     "record_id": preview.record_id,
                 })
+        for preview in previews:
+            if not preview.authorized:
                 continue
             allowed_field_names: list[str] = []
             record_fields: list[FieldDisclosure] = []
@@ -1029,9 +1202,6 @@ class DisclosurePlanner:
                 dropped_reason = None
                 if self._field_forbidden(item.field, preview.table, policy_rules):
                     dropped_reason = "forbid_field"
-                elif self._combo_violations(item.field, [f.field for f in preview.fields],
-                                            preview.table, policy_rules, precision_cap, preview):
-                    dropped_reason = "forbid_combination"
                 if dropped_reason and plan_name == "as_requested":
                     # 按申请全量方案：不删字段，但标注政策禁止，交由确认环节拦截。
                     blocked.append({
@@ -1061,7 +1231,10 @@ class DisclosurePlanner:
                     )
                 record_fields.append(adjusted)
             preview.fields = record_fields
-            include_fields[preview.table] = allowed_field_names
+            include_fields.setdefault(preview.table, []).extend(
+                name for name in allowed_field_names
+                if name not in include_fields.get(preview.table, [])
+            )
             if plan_name == "reduce_precision":
                 # 降到月精度后，只有当月精度仍可与既往记录对齐的组合才算新增可关联内容。
                 date_field_names = {item.field for item in preview.fields if item.date_precision is not None}
@@ -1070,6 +1243,20 @@ class DisclosurePlanner:
                     if not (set(combo["current_fields"]) & date_field_names)
                 ]
             included.append(preview)
+
+        # 受试者级联合组合判定：既有交付 + 同接收方其他待审申请 + 本申请纳入记录。
+        # 只有「历史单独尚不成组合、但三方合在一起后成组合」才算本次新增的政策禁止项；
+        # 无论先确认哪一份申请，都逃不掉同一份判定，确认顺序不能绕过组合限制。
+        combo_blocks = self._union_combo_blocks(
+            included, prior, peers, policy_rules, precision_cap,
+        )
+        for entry in combo_blocks:
+            blocked.append(entry)
+            if plan_name in {"allow_only", "reduce_precision"}:
+                table = entry["table"]
+                field_name = entry["field"]
+                include_fields[table] = [name for name in include_fields.get(table, [])
+                                         if name != field_name]
 
         new_disclosures = self._summarize_new_disclosures(included, precision_cap)
         spec = None
@@ -1098,32 +1285,115 @@ class DisclosurePlanner:
         candidates = {field_name, f"{table}.{field_name}"}
         return any(item in candidates for item in policy_rules.get("forbid_fields", []))
 
-    @staticmethod
-    def _combo_violations(field_name: str, all_fields: list[str], table: str,
-                         policy_rules: dict[str, Any], precision_cap: str,
-                         preview: RecordPreview) -> list[dict[str, Any]]:
-        violations = []
-        present = set(all_fields)
-        for combo in policy_rules.get("forbid_combinations", []):
-            if combo.get("sources") and table not in combo["sources"]:
-                continue
-            if field_name not in combo["fields"]:
-                continue
-            if not set(combo["fields"]) <= present:
-                continue
-            # 组合中的日期字段若被本次精度方案压低到规则阈值以下，则组合不再成立。
-            date_fields = {
-                item.field: item.date_precision
-                for item in preview.fields if item.date_precision is not None
-            }
-            if any(
-                name in date_fields
-                and DATE_PRECISION_ORDER[date_fields[name] or "year"] > DATE_PRECISION_ORDER[precision_cap]
-                for name in combo["fields"]
-            ) and precision_cap != "day":
-                continue
-            violations.append(combo)
-        return violations
+    def _union_combo_blocks(self, included: list[RecordPreview],
+                            prior: list[dict[str, Any]], peers: list[dict[str, Any]],
+                            policy_rules: dict[str, Any],
+                            precision_cap: str) -> list[dict[str, Any]]:
+        """在「历史交付 ∪ 待审同伴 ∪ 本次申请」的受试者字段并集上判定禁止组合。
+
+        对每位受试者分别汇总字段出处：组合在历史交付中已经成立的不拦（政策只管今后）；
+        历史单独不成立、但合入待审申请与本次记录后才成立的组合为本次新增风险，
+        逐字段标注本次记录与所依赖的待审申请。日期字段在当前方案精度下被压低的，
+        该出处不计入，组合可能因此不成立。
+        """
+        combos = policy_rules.get("forbid_combinations", [])
+        if not combos or not included:
+            return []
+        subjects = {preview.pseudonym for preview in included}
+        subjects.update(item["pseudonym"] for item in peers)
+        subjects.update(item["pseudonym"] for item in prior)
+
+        def _source_ok(combo: dict[str, Any], table: str) -> bool:
+            sources = combo.get("sources")
+            return not sources or table in sources
+
+        def _history_presence(subject: str, combo: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
+            presence: dict[str, list[dict[str, str]]] = {}
+            for item in prior:
+                if item["pseudonym"] != subject or not _source_ok(combo, item["table"]):
+                    continue
+                for field_name in item["fields"]:
+                    if field_name not in combo["fields"]:
+                        continue
+                    precision = date_precision_of(item["values"].get(field_name, ""))
+                    if precision is not None \
+                            and DATE_PRECISION_ORDER[precision] > DATE_PRECISION_ORDER[precision_cap]:
+                        continue
+                    presence.setdefault(field_name, []).append({
+                        "table": item["table"], "record_id": item["record_id"],
+                        "application_id": "",
+                    })
+            return presence
+
+        def _peer_presence(subject: str, combo: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
+            presence: dict[str, list[dict[str, str]]] = {}
+            for item in peers:
+                if item["pseudonym"] != subject or not _source_ok(combo, item["table"]):
+                    continue
+                for field_name in item["fields"]:
+                    if field_name not in combo["fields"]:
+                        continue
+                    presence.setdefault(field_name, []).append({
+                        "table": item["table"], "record_id": item["record_id"],
+                        "application_id": item["application_id"],
+                    })
+            return presence
+
+        blocks: list[dict[str, Any]] = []
+        seen: set[tuple] = set()
+        for subject in sorted(subjects):
+            for combo in combos:
+                required = set(combo["fields"])
+                history_presence = _history_presence(subject, combo)
+                if required <= set(history_presence):
+                    # 历史交付中已经可以关联：政策只约束今后新增，旧材料不改写。
+                    continue
+                peer_presence = _peer_presence(subject, combo)
+                current_presence: dict[str, list[dict[str, str]]] = {}
+                for preview in included:
+                    if preview.pseudonym != subject or not _source_ok(combo, preview.table):
+                        continue
+                    for field_item in preview.fields:
+                        if field_item.field not in required:
+                            continue
+                        if field_item.date_precision is not None \
+                                and DATE_PRECISION_ORDER[field_item.date_precision] > DATE_PRECISION_ORDER[precision_cap]:
+                            continue
+                        current_presence.setdefault(field_item.field, []).append({
+                            "table": preview.table, "record_id": preview.record_id,
+                            "application_id": "",
+                        })
+                union_presence: dict[str, list[dict[str, str]]] = {}
+                for presence in (history_presence, peer_presence, current_presence):
+                    for field_name, refs in presence.items():
+                        union_presence.setdefault(field_name, []).extend(refs)
+                if not required <= set(union_presence):
+                    continue
+                contributing = current_presence
+                if not contributing:
+                    # 组合完全由历史与其他待审申请构成：确认本申请既不补齐也不升级它。
+                    continue
+                peer_applications = sorted({
+                    ref["application_id"]
+                    for refs in peer_presence.values() for ref in refs if ref["application_id"]
+                })
+                for field_name in required:
+                    for ref in contributing.get(field_name, ()):
+                        key = (subject, tuple(sorted(required)), ref["table"],
+                               ref["record_id"], field_name, tuple(peer_applications))
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        blocks.append({
+                            "kind": "forbid_combination",
+                            "table": ref["table"],
+                            "record_id": ref["record_id"],
+                            "field": field_name,
+                            "fields": sorted(required),
+                            "pseudonym": subject,
+                            "peer_applications": peer_applications,
+                        })
+        return blocks
 
     def _summarize_new_disclosures(self, included: list[RecordPreview],
                                    precision_cap: str) -> list[dict[str, Any]]:
@@ -1193,7 +1463,14 @@ class DisclosurePlanner:
         plan = preview["plans"].get(plan_name)
         if plan is None:
             raise ValueError(f"未知方案: {plan_name}")
+        application_id = preview.get("application_id")
+        if application_id:
+            # 申请必须仍处于待审状态：被确认或取消过的申请不能再次提交。
+            self.pending.load(batch_id, recipient_id, str(application_id))
         if plan_name == "cancel":
+            if application_id:
+                # 取消不登记：不形成材料、不留交付，待审申请直接移除。
+                self.pending.remove(batch_id, recipient_id, str(application_id))
             return {
                 "cancelled": True,
                 "recipient_id": recipient_id,
@@ -1219,6 +1496,8 @@ class DisclosurePlanner:
                 existing_delivery["policy_revision"],
                 existing_delivery.get("new_disclosures", []),
             )
+            if application_id:
+                self.pending.remove(batch_id, recipient_id, str(application_id))
             return {
                 "cancelled": False,
                 "recipient_id": recipient_id,
@@ -1235,7 +1514,7 @@ class DisclosurePlanner:
         current_snapshot = self.snapshot(batch_id, recipient_id)
         if current_snapshot != preview["snapshot"]:
             raise StalePreviewError(
-                "预览已过期：既有交付范围、授权、政策或导出版本已变化，请重新核对"
+                "预览已过期：既有交付范围、授权、政策、导出版本或同接收方待审申请已变化，请重新核对"
             )
         result = self.builder.build(batch_id, spec)
         recipient = self.recipients.load(batch_id, recipient_id)
@@ -1252,6 +1531,9 @@ class DisclosurePlanner:
             new_disclosures=plan["new_disclosures"],
         )
         entry.setdefault("spec_fingerprint", spec.fingerprint())
+        if application_id:
+            # 确认落地后申请离开待审：它此后作为既有交付出现在联合预览中。
+            self.pending.remove(batch_id, recipient_id, str(application_id))
         return {
             "cancelled": False,
             "recipient_id": recipient_id,

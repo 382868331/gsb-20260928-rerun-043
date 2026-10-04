@@ -57,5 +57,12 @@ class Store:
     def deliveries_index(self, batch_id: str, recipient_id: str) -> Path:
         return self.disclosure_dir(batch_id) / "deliveries" / f"{recipient_id}.json"
 
+    def pending_dir(self, batch_id: str, recipient_id: str) -> Path:
+        """同一接收方同时待审、尚未确认或取消的申请目录。"""
+        return self.disclosure_dir(batch_id) / "pending" / recipient_id
+
+    def pending_file(self, batch_id: str, recipient_id: str, application_id: str) -> Path:
+        return self.pending_dir(batch_id, recipient_id) / f"{application_id}.json"
+
     def material_dir(self, batch_id: str, material_id: str) -> Path:
         return self.disclosure_dir(batch_id) / "materials" / material_id
