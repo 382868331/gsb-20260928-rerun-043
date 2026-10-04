@@ -241,7 +241,7 @@ def cmd_pending_list(args: argparse.Namespace) -> None:
         tables = sorted({item["table"] for item in records})
         print(
             f"  {entry['application_id']} v{entry['request'].get('version')} "
-            f"日期精度 {entry['request'].get('date_precision', 'day')} "
+            f"日期精度 {PendingApplicationStore.entry_date_precision(entry)} "
             f"来源 {','.join(tables) or '-'} 记录 {len(records)} 条 {entry.get('note', '')}"
         )
 

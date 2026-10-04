@@ -12,6 +12,7 @@ from crp.disclosure import (
     DisclosurePolicy,
     DisclosurePolicyError,
     MaterialBuilder,
+    PendingApplicationStore,
     RecipientStore,
     StalePreviewError,
     scan_material_leaks,
@@ -116,7 +117,7 @@ def test_source_rename_without_alias_is_unconfirmed_and_not_guessed(setup):
     assert same_record["basis"] == "unconfirmed"
     subject_summary = next(
         item for item in preview["plans"]["as_requested"]["new_disclosures"]
-        if item["kind"] == "subject_links"
+        if item["kind"] == "subject_links" and item["pseudonym"] == record["pseudonym"]
     )
     assert subject_summary["unconfirmed_prior"]
     # 受试者级关联（同一伪名）仍可确认；缺少依据的只是记录级对应。
@@ -260,3 +261,149 @@ def test_preview_is_bound_to_recipient_and_identity(setup):
     preview = planner.preview(BATCH, "REC-A", _request(version, trace, ["labs"]))
     with pytest.raises(ValueError, match="不一致"):
         planner.confirm(BATCH, "REC-B", preview, "as_requested")
+
+
+def test_pending_joint_preview_reopen_and_stale_after_peer_confirm(setup):
+    store, exporter, version, planner, trace = setup
+    # 两份待审申请落盘：检验按月精度、就诊按默认日精度。
+    planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["labs"], application_id="APP-1", date_precision="month",
+    ), save=True)
+    planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["visits"], application_id="APP-2",
+    ), save=True)
+    # 关闭重开：待审申请从磁盘恢复，每份都显式携带实际日期精度。
+    planner = DisclosurePlanner(store)
+    entries = PendingApplicationStore(store).list(BATCH, "REC-A")
+    assert {item["application_id"]: item["date_precision"] for item in entries} == {
+        "APP-1": "month", "APP-2": "day",
+    }
+    # 联合预览：同伴申请按实际精度进入核对，读取 date_precision 不再缺键崩溃。
+    preview2 = planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["visits"], application_id="APP-2",
+    ), save=True)
+    assert [
+        (item["application_id"], item["date_precision"])
+        for item in preview2["peer_pending"]
+    ] == [("APP-1", "month")]
+    # 确认 APP-1：月精度检验材料落地为 D001。
+    first = planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["labs"], application_id="APP-1", date_precision="month",
+    ), save=True)
+    result1 = planner.confirm(BATCH, "REC-A", first, "as_requested", note="检验（月）")
+    assert result1["delivery_id"] == "D001"
+    material_dir = store.material_dir(BATCH, result1["material_id"])
+    assert all(len(row["collected_at"]) == 7 for row in read_csv(material_dir / "labs.csv"))
+    # APP-2 的旧预览因同接收方待审清单与既有交付变化而过期，必须重审。
+    with pytest.raises(StalePreviewError, match="过期"):
+        planner.confirm(BATCH, "REC-A", preview2, "as_requested")
+    # 重审后确认：APP-1 此后作为既有交付计入联合核对。
+    second = planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["visits"], application_id="APP-2",
+    ), save=True)
+    assert second["peer_pending"] == []
+    assert [item["delivery_id"] for item in second["prior_deliveries"]] == ["D001"]
+    result2 = planner.confirm(BATCH, "REC-A", second, "as_requested", note="就诊")
+    assert result2["delivery_id"] == "D002"
+    assert PendingApplicationStore(store).list(BATCH, "REC-A") == []
+
+
+def test_precision_upgrade_and_combination_not_bypassed_by_confirm_order(setup):
+    store, exporter, version, planner, trace = setup
+    # 检验先按月精度交付。
+    planner.confirm(
+        BATCH, "REC-A",
+        planner.preview(BATCH, "REC-A", _request(version, trace, ["labs"], date_precision="month")),
+        "as_requested", note="检验（月）",
+    )
+    # 检验提升至日精度重审：如实标注较既往实际交付精度（月）的升级。
+    upgrade = planner.preview(BATCH, "REC-A", _request(version, trace, ["labs"], date_precision="day"))
+    fields = {item["field"]: item for item in _record(upgrade["plans"]["as_requested"], "labs")["fields"]}
+    assert fields["collected_at"]["precision_upgrade_from"] == "month"
+    assert fields["collected_at"]["newly_linkable"] is True
+    # 政策禁止「检验日期 + 就诊日期」组合，只约束今后的交付。
+    DisclosurePolicy(store, BATCH).revise(
+        {"forbid_fields": [], "forbid_combinations": [
+            {"fields": ["collected_at", "visit_date"]}
+        ]},
+        note="禁止检验日期+就诊日期组合",
+    )
+    # 两份待审申请：检验日精度升级 + 就诊资料。
+    planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["labs"], application_id="APP-U", date_precision="day",
+    ), save=True)
+    planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["visits"], application_id="APP-V",
+    ), save=True)
+    # 无论先审哪一份，联合判定都拦下组合：改变确认顺序无法绕过。
+    preview_u = planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["labs"], application_id="APP-U", date_precision="day",
+    ), save=True)
+    combo_u = [b for b in preview_u["plans"]["as_requested"]["blocked"]
+               if b["kind"] == "forbid_combination"]
+    assert combo_u and {app for b in combo_u for app in b["peer_applications"]} == {"APP-V"}
+    preview_v = planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["visits"], application_id="APP-V",
+    ), save=True)
+    assert any(b["kind"] == "forbid_combination"
+               for b in preview_v["plans"]["as_requested"]["blocked"])
+    with pytest.raises(DisclosurePolicyError, match="forbid_combination"):
+        planner.confirm(BATCH, "REC-A", preview_v, "as_requested")
+    # 先确认检验（剔除检验日期后交付），就诊申请依旧撞组合：顺序换不掉判定。
+    result_u = planner.confirm(BATCH, "REC-A", preview_u, "allow_only", note="去掉检验日期")
+    material_dir = store.material_dir(BATCH, result_u["material_id"])
+    assert "collected_at" not in read_csv(material_dir / "labs.csv")[0]
+    preview_v2 = planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["visits"], application_id="APP-V",
+    ), save=True)
+    assert any(b["kind"] == "forbid_combination"
+               for b in preview_v2["plans"]["as_requested"]["blocked"])
+    with pytest.raises(DisclosurePolicyError, match="forbid_combination"):
+        planner.confirm(BATCH, "REC-A", preview_v2, "as_requested")
+    # 月精度下两日期仍可关联，组合依旧成立；只有剔除触发字段才能交付。
+    assert any(b["kind"] == "forbid_combination"
+               for b in preview_v2["plans"]["reduce_precision"]["blocked"])
+    result_v = planner.confirm(BATCH, "REC-A", preview_v2, "allow_only", note="去掉就诊日期")
+    material_dir = store.material_dir(BATCH, result_v["material_id"])
+    assert "visit_date" not in read_csv(material_dir / "visits.csv")[0]
+
+
+def test_cancel_leaves_no_registration_and_recipients_are_isolated(setup):
+    store, exporter, version, planner, trace = setup
+    RecipientStore(store).register(BATCH, "REC-B", name="另一家机构")
+    planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["labs"], application_id="APP-1",
+    ), save=True)
+    # 不同接收方的待审申请互不可见。
+    planner.preview(BATCH, "REC-B", _request(
+        version, trace, ["visits"], application_id="APP-9",
+    ), save=True)
+    preview_b = planner.preview(BATCH, "REC-B", _request(
+        version, trace, ["medications"], application_id="APP-10",
+    ), save=True)
+    assert [item["application_id"] for item in preview_b["peer_pending"]] == ["APP-9"]
+    assert preview_b["prior_deliveries"] == []
+    # 取消不登记：不形成材料、不留交付，待审申请直接移除。
+    preview_a = planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["labs"], application_id="APP-1",
+    ), save=True)
+    result = planner.confirm(BATCH, "REC-A", preview_a, "cancel")
+    assert result["cancelled"] is True
+    assert DeliveryRegistry(store).deliveries(BATCH, "REC-A") == []
+    assert PendingApplicationStore(store).list(BATCH, "REC-A") == []
+    # REC-B 的待审申请不受 REC-A 取消影响。
+    assert {
+        item["application_id"]
+        for item in PendingApplicationStore(store).list(BATCH, "REC-B")
+    } == {"APP-9", "APP-10"}
+    # REC-A 确认交付后，REC-B 的既有交付历史仍为空，严格隔离。
+    planner.confirm(
+        BATCH, "REC-A",
+        planner.preview(BATCH, "REC-A", _request(version, trace, ["labs"])),
+        "as_requested", note="d1",
+    )
+    assert DeliveryRegistry(store).deliveries(BATCH, "REC-B") == []
+    preview_b2 = planner.preview(BATCH, "REC-B", _request(
+        version, trace, ["medications"], application_id="APP-10",
+    ), save=True)
+    assert preview_b2["prior_deliveries"] == []

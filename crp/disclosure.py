@@ -626,12 +626,23 @@ class PendingApplicationStore:
             "recipient_id": recipient_id,
             "created_at": _now(),
             "note": note,
+            # 与联合预览记录同一结构：申请级日期精度显式落盘，
+            # 未声明精度的申请明确视为 "day"，不依赖读取方补默认值。
+            "date_precision": str(request.get("date_precision", "day")),
             "request": self._canonical_request(request),
         }
         write_json(
             self.store.pending_file(batch_id, recipient_id, application_id), entry,
         )
         return entry
+
+    @staticmethod
+    def entry_date_precision(entry: dict[str, Any]) -> str:
+        """待审申请的实际日期精度；兼容早期未落盘该键的登记。"""
+        precision = entry.get("date_precision")
+        if precision is None:
+            precision = entry.get("request", {}).get("date_precision", "day")
+        return str(precision)
 
     def load(self, batch_id: str, recipient_id: str, application_id: str) -> dict[str, Any]:
         path = self.store.pending_file(batch_id, recipient_id, application_id)
@@ -781,7 +792,8 @@ class DisclosurePlanner:
 
     # ---- 既有交付快照 -------------------------------------------------
 
-    def snapshot(self, batch_id: str, recipient_id: str) -> str:
+    def snapshot(self, batch_id: str, recipient_id: str,
+                 exclude_application_id: str | None = None) -> str:
         recipient = self.recipients.load(batch_id, recipient_id)
         policy = DisclosurePolicy(self.store, batch_id).load()
         index_path = self.store.export_index(batch_id)
@@ -811,7 +823,8 @@ class DisclosurePlanner:
                     "application_id": item["application_id"],
                     "request_fingerprint": self.pending.request_fingerprint(item),
                 }
-                for item in self.pending.list(batch_id, recipient_id)
+                for item in self.pending.list(batch_id, recipient_id,
+                                              exclude=exclude_application_id)
             ],
         }
         return sha256_text(stable_json(summary))
@@ -857,7 +870,7 @@ class DisclosurePlanner:
         peers: list[dict[str, Any]] = []
         for entry in self.pending.list(batch_id, recipient_id, exclude=exclude_application_id):
             request = entry["request"]
-            requested_precision = request.get("date_precision", "day")
+            requested_precision = self.pending.entry_date_precision(entry)
             effective_precision = requested_precision
             if DATE_PRECISION_ORDER[effective_precision] > DATE_PRECISION_ORDER[precision_cap]:
                 effective_precision = precision_cap
@@ -981,8 +994,12 @@ class DisclosurePlanner:
         application_id = request.get("application_id")
         if save and not application_id:
             raise ValueError("保存待审申请时必须提供 application_id")
-        # 快照必须在申请落盘前取：其中的待审清单不包含本申请自身。
-        snapshot = self.snapshot(batch_id, recipient_id)
+        # 快照口径与确认时一致：待审清单不包含本申请自身（本申请身份由
+        # 待审登记与预览绑定核对，其变化不通过快照判定）。
+        snapshot = self.snapshot(
+            batch_id, recipient_id,
+            exclude_application_id=str(application_id) if application_id else None,
+        )
         if application_id:
             self.pending.save(batch_id, recipient_id, str(application_id), request,
                               note=str(request.get("note", "")))
@@ -1054,7 +1071,7 @@ class DisclosurePlanner:
             "peer_pending": [
                 {
                     "application_id": item["application_id"],
-                    "date_precision": item["date_precision"],
+                    "date_precision": self.pending.entry_date_precision(item),
                     "records": [
                         {"table": record["table"], "record_id": record["record_id"]}
                         for record in peers_day
@@ -1176,7 +1193,11 @@ class DisclosurePlanner:
                 material_spec=None,
             )
 
-        precision_cap = "month" if plan_name == "reduce_precision" else "day"
+        # 本次申请声明的日期精度即实际交付精度的上限；reduce_precision 再压到月。
+        precision_cap = str(request.get("date_precision", "day"))
+        if plan_name == "reduce_precision" and (
+                DATE_PRECISION_ORDER[precision_cap] > DATE_PRECISION_ORDER["month"]):
+            precision_cap = "month"
         peers = self._peer_pending_records(
             batch_id, recipient_id,
             exclude_application_id=str(request.get("application_id"))
@@ -1510,8 +1531,12 @@ class DisclosurePlanner:
                 "blocked": plan["blocked"],
             }
         # 新材料的首次确认才做过期核对：预览生成后若既有交付增加（或授权/政策/导出变化），
-        # 拒绝提交过期预览。
-        current_snapshot = self.snapshot(batch_id, recipient_id)
+        # 拒绝提交过期预览。本申请自身不计入快照（与预览生成时的口径一致，
+        # 其身份已由待审登记与预览绑定核对）。
+        current_snapshot = self.snapshot(
+            batch_id, recipient_id,
+            exclude_application_id=str(application_id) if application_id else None,
+        )
         if current_snapshot != preview["snapshot"]:
             raise StalePreviewError(
                 "预览已过期：既有交付范围、授权、政策、导出版本或同接收方待审申请已变化，请重新核对"
