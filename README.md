@@ -60,6 +60,17 @@ python -m crp confirm-disclosure STUDY-001 REC-A --preview preview.json --plan a
 # 政策修订（禁止字段/字段组合）只约束今后的新交付，历史交付不改写
 python -m crp revise-policy STUDY-001 \
     --rules-json '{"forbid_combinations":[{"fields":["visit_date","department"]}]}' --note '禁止日期+科室'
+# 同一接收者两份申请可以同时待审：保存后按申请 ID 做联合预览（含其他待审申请）
+python -m crp submit-application STUDY-001 REC-A APP-LABS \
+    --request-json '{"version":1,"date_precision":"month","records":[{"table":"labs","record_id":"labs:visit_id=V001;test_code=LDL"}]}' \
+    --note '月精度检验'
+python -m crp submit-application STUDY-001 REC-A APP-VISITS \
+    --request-json '{"version":1,"records":[{"table":"visits","record_id":"visits:visit_id=V001"}]}' \
+    --note '就诊资料'
+python -m crp applications STUDY-001 REC-A
+python -m crp disclosure-preview STUDY-001 REC-A --application APP-VISITS --output preview.json
+# 先确认其中一份后，另一份的旧预览立即过期，必须重新预览（会基于已交付的实际内容核对）
+python -m crp confirm-disclosure STUDY-001 REC-A --preview preview.json --plan cancel  # 取消不登记
 # 接收者授权缩小同样只影响此后的交付
 python -m crp narrow-authorization STUDY-001 REC-A \
     --scope-json '{"sources":["labs"]}' --note '缩小到检验来源'
@@ -96,6 +107,7 @@ python -m crp deliveries STUDY-001 REC-A
 
 - **接收者档案与授权修订**（`disclosure/<batch>/recipients/`）：每个接收者独立登记，授权范围
   只增不改；后来缩小授权只影响之后的交付，之前收到什么仍有准确记录；
+  同时待审的资料申请保存在 `disclosure/<batch>/applications/<recipient>.json`，按接收者隔离；
 - **不可变对外材料**（`disclosure/<batch>/materials/Mxxxx/`）：由冻结的导出版本、记录选择、
   日期精度与来源别名确定性派生（材料 ID 即其规格指纹）；保存或网络重试辨认出同一份材料时
   复用同一 `material_id`，只累加 `attempts`，绝不重复计入披露；
@@ -111,6 +123,20 @@ python -m crp deliveries STUDY-001 REC-A
 - **四种方案对比**：`as_requested`（全部，撞政策时确认被拦截）、`allow_only`（剔除授权外/政策禁止
   的字段或记录）、`reduce_precision`（日期降至月，重新计算仍成立的组合）、`cancel`（不形成材料），
   每种方案各自列出仍会新增的可关联内容与采用规则；
+- **同时待审申请的联合核对**：申请可用 `submit-application` 保存为待审状态（落盘，重开可继续），
+  `disclosure-preview --application <id>` 不仅核对既有交付，还把**同一接收者其他待审申请**视为
+  「若都获批将一并公开」，逐条列出 `pending_combination`（与待审同伴的新组合）并按政策做
+  **跨申请联合组合判定**：各申请单独看都安全、但合在一起可关联出日期+科室+检验时，`as_requested`
+  确认被拦截，且无论按什么顺序确认都绕不过；`blocked` 条目带 `cross_union` 依据说明字段来自哪份
+  已交付材料或待审申请；
+- **精度决定组合是否成立**：跨来源精确关联要求组合中的日期字段最终都以日精度公开。月精度检验与
+  日精度就诊资料同时待审时不构成精确组合（但仍如实列出联合后可关联内容）；其中一份先交付后，
+  另一份的旧预览**立即失效**，必须重审，且重审依据的是**实际交付**的精度（月），而不是申请设想；
+  后续再申请把同一检验提升到日精度时，会重新形成与已交付就诊资料的精确组合并被拦截；
+- **取消不登记、确认留痕、接收者隔离**：`cancel` 方案与 `cancel-application` 把待审申请直接移除，
+  不形成材料、不留申请登记；确认后申请标记为 `confirmed` 并记录交付 ID；政策/授权修订只影响今后
+  的预览与交付，不改写旧材料与历史登记；待审申请、交付登记与联合快照全部按接收者分文件保存，
+  不同接收者的历史与待审互不可见；
 - **内外有别**：`audit_note` 等内部审计说明（可含真实编号）只写入内部交付登记
   `disclosure/<batch>/deliveries/<recipient>.json`，绝不进入对外材料目录；材料目录整体经过
   真实编号、人工敏感片段与内置敏感模式扫描（`scan_material_leaks`）。

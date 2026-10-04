@@ -174,10 +174,16 @@ def cmd_policy_revise(args: argparse.Namespace) -> None:
 
 
 def cmd_disclosure_preview(args: argparse.Namespace) -> None:
-    if not args.request and not args.request_json:
-        raise SystemExit("必须通过 --request 或 --request-json 提供本次资料申请")
-    request = _json_arg(args.request, args.request_json)
-    preview = DisclosurePlanner(_store(args)).preview(args.batch_id, args.recipient_id, request)
+    if not args.application and not args.request and not args.request_json:
+        raise SystemExit("必须通过 --application 引用已保存待审申请，或用 --request/--request-json 提供申请")
+    planner = DisclosurePlanner(_store(args))
+    if args.application:
+        preview = planner.preview(
+            args.batch_id, args.recipient_id, application_id=args.application,
+        )
+    else:
+        request = _json_arg(args.request, args.request_json)
+        preview = planner.preview(args.batch_id, args.recipient_id, request)
     if args.output:
         Path(args.output).write_text(json.dumps(preview, ensure_ascii=False, indent=2) + "\n",
                                       encoding="utf-8")
@@ -186,6 +192,11 @@ def cmd_disclosure_preview(args: argparse.Namespace) -> None:
         f"授权 v{preview['authorization_revision']}，政策 v{preview['policy_revision']}，"
         f"既有交付 {len(preview['prior_deliveries'])} 次"
     )
+    for item in preview.get("pending_applications", []):
+        print(
+            f"  同时待审申请 {item['application_id']}：{item['record_count']} 条记录，"
+            f"日期精度 {item['date_precision']}（{item['note']}）"
+        )
     for name, plan in preview["plans"].items():
         print(f"  [{name}] {plan['description']}")
         print(f"    交付 {len(plan['included_records'])} 条；新增可关联内容 {len(plan['new_disclosures'])} 项；"
@@ -208,12 +219,49 @@ def cmd_disclosure_confirm(args: argparse.Namespace) -> None:
         raise SystemExit(str(exc))
     if result["cancelled"]:
         print("已取消本次交付，未形成任何对外材料")
+        if result.get("application_id"):
+            print(f"待审申请 {result['application_id']} 已取消且不登记")
         return
     reused = "（同一份对外材料，未重复计入披露）" if result["delivery_reused"] else ""
     print(
         f"已登记交付 {result['delivery_id']}：材料 {result['material_id']}{reused}；"
         f"新增可关联内容 {len(result['new_disclosures'])} 项"
     )
+
+
+def cmd_application_submit(args: argparse.Namespace) -> None:
+    if not args.request and not args.request_json:
+        raise SystemExit("必须通过 --request 或 --request-json 提供申请内容")
+    request = _json_arg(args.request, args.request_json)
+    entry = DisclosurePlanner(_store(args)).submit_application(
+        args.batch_id, args.recipient_id, args.application_id, request, note=args.note,
+    )
+    print(
+        f"待审申请 {entry['application_id']} 已保存（状态 pending）："
+        f"{len(entry['request'].get('records', []))} 条记录"
+    )
+
+
+def cmd_application_cancel(args: argparse.Namespace) -> None:
+    DisclosurePlanner(_store(args)).cancel_application(
+        args.batch_id, args.recipient_id, args.application_id,
+    )
+    print(f"待审申请 {args.application_id} 已取消：不形成材料、不留申请登记")
+
+
+def cmd_applications_list(args: argparse.Namespace) -> None:
+    pending = DisclosurePlanner(_store(args)).applications_pending(
+        args.batch_id, args.recipient_id,
+    )
+    if not pending:
+        print(f"接收者 {args.recipient_id} 暂无待审申请")
+        return
+    print(f"接收者 {args.recipient_id} 的待审申请：")
+    for item in pending:
+        print(
+            f"  {item['application_id']} 提交于 {item['submitted_at']} "
+            f"{len(item['request'].get('records', []))} 条记录 {item.get('note', '')}"
+        )
 
 
 def cmd_deliveries(args: argparse.Namespace) -> None:
@@ -297,6 +345,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("disclosure-preview", help="按接收者核对多次交付合在一起会公开什么")
     p.add_argument("batch_id")
     p.add_argument("recipient_id")
+    p.add_argument("--application", help="引用已保存的待审申请 ID（与同接收者其他待审申请联合预览）")
     p.add_argument("--request")
     p.add_argument("--request-json")
     p.add_argument("--output", help="把含快照的完整预览写入 JSON 文件，供 confirm 回传")
@@ -311,6 +360,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note", default="")
     p.add_argument("--audit-note", default="")
     p.set_defaults(func=cmd_disclosure_confirm)
+
+    p = sub.add_parser("submit-application", help="保存一份待审资料申请（可与同接收者其他待审申请联合核对）")
+    p.add_argument("batch_id")
+    p.add_argument("recipient_id")
+    p.add_argument("application_id")
+    p.add_argument("--request")
+    p.add_argument("--request-json")
+    p.add_argument("--note", default="")
+    p.set_defaults(func=cmd_application_submit)
+
+    p = sub.add_parser("cancel-application", help="取消待审申请：不形成材料也不留登记")
+    p.add_argument("batch_id")
+    p.add_argument("recipient_id")
+    p.add_argument("application_id")
+    p.set_defaults(func=cmd_application_cancel)
+
+    p = sub.add_parser("applications", help="列出接收者的待审申请")
+    p.add_argument("batch_id")
+    p.add_argument("recipient_id")
+    p.set_defaults(func=cmd_applications_list)
 
     p = sub.add_parser("deliveries", help="列出接收者的既有交付记录")
     p.add_argument("batch_id")

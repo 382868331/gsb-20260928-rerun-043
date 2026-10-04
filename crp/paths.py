@@ -57,5 +57,9 @@ class Store:
     def deliveries_index(self, batch_id: str, recipient_id: str) -> Path:
         return self.disclosure_dir(batch_id) / "deliveries" / f"{recipient_id}.json"
 
+    def applications_index(self, batch_id: str, recipient_id: str) -> Path:
+        """按接收者保存待审申请及其状态（确认后留痕，取消不登记）。"""
+        return self.disclosure_dir(batch_id) / "applications" / f"{recipient_id}.json"
+
     def material_dir(self, batch_id: str, material_id: str) -> Path:
         return self.disclosure_dir(batch_id) / "materials" / material_id
