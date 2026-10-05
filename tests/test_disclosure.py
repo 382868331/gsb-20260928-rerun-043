@@ -260,3 +260,97 @@ def test_preview_is_bound_to_recipient_and_identity(setup):
     preview = planner.preview(BATCH, "REC-A", _request(version, trace, ["labs"]))
     with pytest.raises(ValueError, match="不一致"):
         planner.confirm(BATCH, "REC-B", preview, "as_requested")
+
+
+def test_pending_applications_persist_and_recheck_uses_delivered_precision(setup):
+    store, exporter, version, planner, trace = setup
+    RecipientStore(store).register(BATCH, "REC-B", name="另一家机构")
+    DisclosurePolicy(store, BATCH).revise(
+        {"forbid_fields": [], "forbid_combinations": [
+            {"fields": ["collected_at", "department"],
+             "sources": ["labs", "visits"]}
+        ]},
+        note="禁止检验日期与就诊科室组合",
+    )
+
+    month_labs = _request(
+        version, trace, ["labs"], application_id="LAB-MONTH", date_precision="month",
+    )
+    visit_request = _request(version, trace, ["visits"], application_id="VISIT-MONTH")
+    planner.preview(BATCH, "REC-A", month_labs)
+    stale_visit = planner.preview(BATCH, "REC-A", visit_request)
+
+    # 关闭流程后重开：待审申请仍在磁盘上，且非日期字段显式为 None，不依赖缺省键。
+    reopened = DisclosurePlanner(store)
+    assert {item["application_id"] for item in reopened.pending.list(BATCH, "REC-A")} == {
+        "LAB-MONTH", "VISIT-MONTH",
+    }
+    current_labs = reopened.preview(BATCH, "REC-A", month_labs)
+    assert current_labs["peer_pending"][0]["date_precision"] == "day"
+    assert all(
+        field["date_precision"] is None
+        for record in current_labs["plans"]["as_requested"]["included_records"]
+        for field in record["fields"]
+        if field["field"] in {"subject_id", "visit_id", "test_code", "value", "unit", "remark"}
+    )
+    month_result = reopened.confirm(BATCH, "REC-A", current_labs, "as_requested", note="月精度检验")
+    month_material = read_csv(
+        store.material_dir(BATCH, month_result["material_id"]) / "labs.csv"
+    )
+    assert all(len(row["collected_at"]) == 7 for row in month_material)
+    with pytest.raises(StalePreviewError, match="过期"):
+        reopened.confirm(BATCH, "REC-A", stale_visit, "as_requested")
+
+    # 旧预览必须重审；历史检验实际只有月精度，因此不构成日精度的检验日期+科室组合。
+    month_recheck = reopened.preview(BATCH, "REC-A", visit_request)
+    assert not month_recheck["plans"]["as_requested"]["blocked"]
+
+
+def test_upgrade_to_day_precision_combination_cannot_bypass_confirmation_order(setup):
+    store, exporter, version, planner, trace = setup
+    DisclosurePolicy(store, BATCH).revise(
+        {"forbid_fields": [], "forbid_combinations": [
+            {"fields": ["collected_at", "department"],
+             "sources": ["labs", "visits"]}
+        ]},
+        note="禁止检验日期与就诊科室组合",
+    )
+
+    month_labs = _request(
+        version, trace, ["labs"], application_id="LAB-MONTH", date_precision="month",
+    )
+    planner.confirm(
+        BATCH, "REC-A", planner.preview(BATCH, "REC-A", month_labs),
+        "as_requested", note="先交付月精度检验",
+    )
+    day_labs = _request(version, trace, ["labs"], application_id="LAB-DAY")
+    day_visit = _request(version, trace, ["visits"], application_id="VISIT-DAY")
+    planner.preview(BATCH, "REC-A", day_labs)
+    planner.preview(BATCH, "REC-A", day_visit)
+    labs_preview = planner.preview(BATCH, "REC-A", day_labs)
+    visit_preview = planner.preview(BATCH, "REC-A", day_visit)
+
+    assert any(
+        item["kind"] == "forbid_combination"
+        and item["peer_applications"] == ["VISIT-DAY"]
+        for item in labs_preview["plans"]["as_requested"]["blocked"]
+    )
+    assert any(
+        item["kind"] == "forbid_combination"
+        and item["peer_applications"] == ["LAB-DAY"]
+        for item in visit_preview["plans"]["as_requested"]["blocked"]
+    )
+    with pytest.raises(DisclosurePolicyError, match="forbid_combination"):
+        planner.confirm(BATCH, "REC-A", labs_preview, "as_requested")
+    with pytest.raises(DisclosurePolicyError, match="forbid_combination"):
+        planner.confirm(BATCH, "REC-A", visit_preview, "as_requested")
+
+    # 取消不登记；不同接收方看不到 A 的待审申请，也看不到 A 的交付历史。
+    cancelled = planner.confirm(BATCH, "REC-A", visit_preview, "cancel")
+    assert cancelled["cancelled"] is True
+    assert len(DeliveryRegistry(store).deliveries(BATCH, "REC-A")) == 1
+    RecipientStore(store).register(BATCH, "REC-B", name="另一家机构")
+    assert [item["application_id"] for item in planner.pending.list(BATCH, "REC-A")] == ["LAB-DAY"]
+    isolated = planner.preview(BATCH, "REC-B", _request(version, trace, ["visits"]))
+    assert isolated["prior_deliveries"] == []
+    assert isolated["peer_pending"] == []

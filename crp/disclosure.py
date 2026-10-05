@@ -663,7 +663,11 @@ class PendingApplicationStore:
     def _canonical_request(request: dict[str, Any]) -> dict[str, Any]:
         """剔除仅用于存储控制、不构成资料身份的键后规范化申请。"""
         skip = {"application_id"}
-        return {str(key): value for key, value in sorted(request.items()) if key not in skip}
+        canonical = {
+            str(key): value for key, value in sorted(request.items()) if key not in skip
+        }
+        canonical["date_precision"] = DisclosurePlanner.request_date_precision(canonical)
+        return canonical
 
     def request_fingerprint(self, entry: dict[str, Any]) -> str:
         return sha256_text(stable_json(entry["request"]))
@@ -779,6 +783,13 @@ class DisclosurePlanner:
         self.pending = PendingApplicationStore(store)
         self.builder = MaterialBuilder(store)
 
+    @staticmethod
+    def request_date_precision(request: dict[str, Any]) -> str:
+        precision = request.get("date_precision", "day")
+        if precision not in DATE_PRECISION_ORDER:
+            raise ValueError(f"未知日期精度: {precision}")
+        return precision
+
     # ---- 既有交付快照 -------------------------------------------------
 
     def snapshot(self, batch_id: str, recipient_id: str) -> str:
@@ -839,7 +850,8 @@ class DisclosurePlanner:
                     "pseudonym": trace["subject_id"],
                     "fields": set(row.keys()),
                     "values": dict(row),
-                    "date_precision": trace.get("date_precision", "day"),
+                    "date_precision": trace.get("date_precision")
+                    if trace.get("date_precision") in DATE_PRECISION_ORDER else "day",
                     "status": "delivered",
                     "application_id": None,
                 })
@@ -857,7 +869,7 @@ class DisclosurePlanner:
         peers: list[dict[str, Any]] = []
         for entry in self.pending.list(batch_id, recipient_id, exclude=exclude_application_id):
             request = entry["request"]
-            requested_precision = request.get("date_precision", "day")
+            requested_precision = self.request_date_precision(request)
             effective_precision = requested_precision
             if DATE_PRECISION_ORDER[effective_precision] > DATE_PRECISION_ORDER[precision_cap]:
                 effective_precision = precision_cap
@@ -889,7 +901,8 @@ class DisclosurePlanner:
 
     # ---- 本次申请记录 -------------------------------------------------
 
-    def _requested_records(self, batch_id: str, request: dict[str, Any]) -> list[dict[str, Any]]:
+    def _requested_records(self, batch_id: str, request: dict[str, Any],
+                           precision_cap: str | None = None) -> list[dict[str, Any]]:
         version = int(request["version"])
         version_dir = self.store.version_dir(batch_id, version)
         wanted = request.get("records")
@@ -913,6 +926,15 @@ class DisclosurePlanner:
                 if wanted_keys is not None and trace["record_id"] not in wanted_keys.get(table, set()):
                     continue
                 row = rows[int(trace["output_row"]) - 2]
+                effective_precision = precision_cap or self.request_date_precision(request)
+                if effective_precision != "day":
+                    row = {
+                        name: truncate_date(value, effective_precision)
+                        if date_precision_of(value) is not None
+                        and DATE_PRECISION_ORDER[date_precision_of(value)] > DATE_PRECISION_ORDER[effective_precision]
+                        else value
+                        for name, value in row.items()
+                    }
                 requested.append({
                     "table": table,
                     "source_name": source_names.get(table, table),
@@ -981,12 +1003,15 @@ class DisclosurePlanner:
         application_id = request.get("application_id")
         if save and not application_id:
             raise ValueError("保存待审申请时必须提供 application_id")
-        # 快照必须在申请落盘前取：其中的待审清单不包含本申请自身。
-        snapshot = self.snapshot(batch_id, recipient_id)
         if application_id:
             self.pending.save(batch_id, recipient_id, str(application_id), request,
                               note=str(request.get("note", "")))
-        requested = self._requested_records(batch_id, request)
+        # 当前申请确认前会一直留在待审清单中；快照包含它，重开或重发预览后仍可核对。
+        snapshot = self.snapshot(batch_id, recipient_id)
+        requested_precision = self.request_date_precision(request)
+        requested = self._requested_records(
+            batch_id, request, precision_cap=requested_precision,
+        )
         prior = self._prior_records(batch_id, recipient_id)
         peers_day = self._peer_pending_records(
             batch_id, recipient_id,
@@ -1020,8 +1045,8 @@ class DisclosurePlanner:
                 first_by = (prior_record or prior_subject or {}).get("delivery_id") if (prior_record or prior_subject) else None
                 upgrade_from = None
                 if precision is not None and prior_subject is not None:
-                    prior_precision = prior_subject.get("precision") or "day"
-                    if DATE_PRECISION_ORDER[precision] > DATE_PRECISION_ORDER[prior_precision]:
+                    prior_precision = prior_subject.get("precision")
+                    if prior_precision in DATE_PRECISION_ORDER and +                            DATE_PRECISION_ORDER[precision] > DATE_PRECISION_ORDER[prior_precision]:
                         upgrade_from = prior_precision
                 newly = prior_subject is None or upgrade_from is not None
                 preview.fields.append(FieldDisclosure(
@@ -1031,13 +1056,16 @@ class DisclosurePlanner:
                     precision_upgrade_from=upgrade_from,
                     first_delivered_by=first_by,
                 ))
-            preview.new_combinations = self._new_combinations(record, links, joint_day, "day")
+            preview.new_combinations = self._new_combinations(
+                record, links, joint_day, requested_precision,
+            )
             previews.append(preview)
 
         plans = {}
         for plan_name in ("as_requested", "allow_only", "reduce_precision", "cancel"):
+            plan_previews = [self._copy_record_preview(item) for item in previews]
             plans[plan_name] = self._evaluate_plan(
-                plan_name, previews, request, policy_rules, authorization,
+                plan_name, plan_previews, request, policy_rules, authorization,
                 policy_revision, prior, peers_day, batch_id, recipient_id,
             ).to_dict()
 
@@ -1054,7 +1082,7 @@ class DisclosurePlanner:
             "peer_pending": [
                 {
                     "application_id": item["application_id"],
-                    "date_precision": item["date_precision"],
+                    "date_precision": self.request_date_precision(item["request"]),
                     "records": [
                         {"table": record["table"], "record_id": record["record_id"]}
                         for record in peers_day
@@ -1078,6 +1106,19 @@ class DisclosurePlanner:
         }
 
     @staticmethod
+    def _copy_record_preview(preview: RecordPreview) -> RecordPreview:
+        return RecordPreview(
+            table=preview.table,
+            source_name=preview.source_name,
+            record_id=preview.record_id,
+            pseudonym=preview.pseudonym,
+            authorized=preview.authorized,
+            links=list(preview.links),
+            fields=list(preview.fields),
+            new_combinations=[dict(item) for item in preview.new_combinations],
+        )
+
+    @staticmethod
     def _subject_field_history(prior: list[dict[str, Any]], pseudonym: str) -> dict[str, dict[str, Any]]:
         history: dict[str, dict[str, Any]] = {}
         for item in prior:
@@ -1087,9 +1128,12 @@ class DisclosurePlanner:
                 value = item["values"].get(field_name, "")
                 precision = date_precision_of(value)
                 existing = history.get(field_name)
+                existing_precision = existing.get("precision") if existing else None
                 if existing is None or (
-                    precision is not None
-                    and DATE_PRECISION_ORDER[precision] > DATE_PRECISION_ORDER[existing.get("precision") or "year"]
+                    precision is not None and (
+                        existing_precision is None
+                        or DATE_PRECISION_ORDER[precision] > DATE_PRECISION_ORDER[existing_precision]
+                    )
                 ):
                     history[field_name] = {
                         "delivery_id": item["delivery_id"],
@@ -1176,7 +1220,11 @@ class DisclosurePlanner:
                 material_spec=None,
             )
 
-        precision_cap = "month" if plan_name == "reduce_precision" else "day"
+        requested_precision = self.request_date_precision(request)
+        precision_cap = requested_precision
+        if plan_name == "reduce_precision" and \
+                DATE_PRECISION_ORDER[precision_cap] > DATE_PRECISION_ORDER["month"]:
+            precision_cap = "month"
         peers = self._peer_pending_records(
             batch_id, recipient_id,
             exclude_application_id=str(request.get("application_id"))
@@ -1235,13 +1283,6 @@ class DisclosurePlanner:
                 name for name in allowed_field_names
                 if name not in include_fields.get(preview.table, [])
             )
-            if plan_name == "reduce_precision":
-                # 降到月精度后，只有当月精度仍可与既往记录对齐的组合才算新增可关联内容。
-                date_field_names = {item.field for item in preview.fields if item.date_precision is not None}
-                preview.new_combinations = [
-                    combo for combo in preview.new_combinations
-                    if not (set(combo["current_fields"]) & date_field_names)
-                ]
             included.append(preview)
 
         # 受试者级联合组合判定：既有交付 + 同接收方其他待审申请 + 本申请纳入记录。
@@ -1258,7 +1299,9 @@ class DisclosurePlanner:
                 include_fields[table] = [name for name in include_fields.get(table, [])
                                          if name != field_name]
 
-        new_disclosures = self._summarize_new_disclosures(included, precision_cap)
+        new_disclosures = self._summarize_new_disclosures(
+            included, precision_cap, reduced=plan_name == "reduce_precision",
+        )
         spec = None
         if included:
             spec = MaterialSpec(
@@ -1316,8 +1359,7 @@ class DisclosurePlanner:
                     if field_name not in combo["fields"]:
                         continue
                     precision = date_precision_of(item["values"].get(field_name, ""))
-                    if precision is not None \
-                            and DATE_PRECISION_ORDER[precision] > DATE_PRECISION_ORDER[precision_cap]:
+                    if precision is not None and (precision != "day" or precision_cap != "day"):
                         continue
                     presence.setdefault(field_name, []).append({
                         "table": item["table"], "record_id": item["record_id"],
@@ -1332,6 +1374,9 @@ class DisclosurePlanner:
                     continue
                 for field_name in item["fields"]:
                     if field_name not in combo["fields"]:
+                        continue
+                    precision = date_precision_of(item["values"].get(field_name, ""))
+                    if precision is not None and (precision != "day" or precision_cap != "day"):
                         continue
                     presence.setdefault(field_name, []).append({
                         "table": item["table"], "record_id": item["record_id"],
@@ -1356,8 +1401,7 @@ class DisclosurePlanner:
                     for field_item in preview.fields:
                         if field_item.field not in required:
                             continue
-                        if field_item.date_precision is not None \
-                                and DATE_PRECISION_ORDER[field_item.date_precision] > DATE_PRECISION_ORDER[precision_cap]:
+                        if field_item.date_precision is not None and precision_cap != "day":
                             continue
                         current_presence.setdefault(field_item.field, []).append({
                             "table": preview.table, "record_id": preview.record_id,
@@ -1396,7 +1440,7 @@ class DisclosurePlanner:
         return blocks
 
     def _summarize_new_disclosures(self, included: list[RecordPreview],
-                                   precision_cap: str) -> list[dict[str, Any]]:
+                                   precision_cap: str, reduced: bool = False) -> list[dict[str, Any]]:
         summary: list[dict[str, Any]] = []
         seen_subjects: set[str] = set()
         for preview in included:
@@ -1408,12 +1452,14 @@ class DisclosurePlanner:
                     "record_id": preview.record_id,
                     "pseudonym": preview.pseudonym,
                     "field": item.field,
-                    "date_precision": item.date_precision if precision_cap == "day" else (
-                        "month" if item.date_precision is not None and
-                        DATE_PRECISION_ORDER[item.date_precision] > DATE_PRECISION_ORDER["month"]
+                    "date_precision": (
+                        precision_cap if item.date_precision is not None and
+                        DATE_PRECISION_ORDER[item.date_precision] > DATE_PRECISION_ORDER[precision_cap]
                         else item.date_precision
                     ),
-                    "precision_upgrade_from": None if precision_cap == "reduce_precision" else item.precision_upgrade_from,
+                    "precision_upgrade_from": (
+                        None if reduced else item.precision_upgrade_from
+                    ),
                     "linkable_to": [
                         {"delivery_id": link.delivery_id, "record_id": link.record_id,
                          "source_name": link.source_name, "basis": link.basis}
@@ -1479,12 +1525,6 @@ class DisclosurePlanner:
             }
         if not plan["included_records"]:
             raise ValueError("该方案没有任何可交付记录；请改用 cancel 方案")
-        if plan["blocked"] and plan_name == "as_requested":
-            raise DisclosurePolicyError(
-                "当前政策/授权不允许本次组合披露: "
-                + "; ".join(f"{item['kind']}:{item.get('table', '')}/{item.get('field', item.get('record_id', ''))}"
-                             for item in plan["blocked"])
-            )
         spec = MaterialSpec.from_dict(plan["material_spec"])
         material_id = self.builder.material_id(batch_id, spec)
         existing_delivery = self.registry.find_by_material(batch_id, recipient_id, material_id)
@@ -1509,13 +1549,19 @@ class DisclosurePlanner:
                 "new_disclosures": entry.get("new_disclosures", []),
                 "blocked": plan["blocked"],
             }
-        # 新材料的首次确认才做过期核对：预览生成后若既有交付增加（或授权/政策/导出变化），
-        # 拒绝提交过期预览。
         current_snapshot = self.snapshot(batch_id, recipient_id)
         if current_snapshot != preview["snapshot"]:
             raise StalePreviewError(
                 "预览已过期：既有交付范围、授权、政策、导出版本或同接收方待审申请已变化，请重新核对"
             )
+        if plan["blocked"] and plan_name == "as_requested":
+            raise DisclosurePolicyError(
+                "当前政策/授权不允许本次组合披露: "
+                + "; ".join(f"{item['kind']}:{item.get('table', '')}/{item.get('field', item.get('record_id', ''))}"
+                             for item in plan["blocked"])
+            )
+        # 新材料的首次确认才做过期核对：预览生成后若既有交付增加（或授权/政策/导出变化），
+        # 拒绝提交过期预览。
         result = self.builder.build(batch_id, spec)
         recipient = self.recipients.load(batch_id, recipient_id)
         policy_revision = int(preview["policy_revision"])
