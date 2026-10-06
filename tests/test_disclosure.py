@@ -407,3 +407,134 @@ def test_cancel_leaves_no_registration_and_recipients_are_isolated(setup):
         version, trace, ["medications"], application_id="APP-10",
     ), save=True)
     assert preview_b2["prior_deliveries"] == []
+
+
+def test_month_precision_application_distinguishes_source_and_public_precision(setup):
+    """同一份报告：纳入记录按来源标 day，本次公开标 month，两者都显式可见。"""
+    store, exporter, version, planner, trace = setup
+    preview = planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["labs"], application_id="APP-1", date_precision="month",
+    ), save=True)
+    assert preview["requested_date_precision"] == "month"
+    record = _record(preview["plans"]["as_requested"], "labs")
+    fields = {item["field"]: item for item in record["fields"]}
+    collected = fields["collected_at"]
+    # 来源资料（冻结导出版本）中是日精度；本次申请实际公开为月精度。
+    assert collected["date_field"] is True
+    assert collected["source_date_precision"] == "day"
+    assert collected["date_precision"] == "month"
+    # 非日期字段明确不是日期字段：null 表示「无日期」而非缺省或未知。
+    for name in ("subject_id", "test_code", "value", "unit", "remark"):
+        assert fields[name]["date_field"] is False
+        assert fields[name]["source_date_precision"] is None
+        assert fields[name]["date_precision"] is None
+    # 新增内容汇总同样分列两级精度。
+    new_field = next(
+        item for item in preview["plans"]["as_requested"]["new_disclosures"]
+        if item["kind"] == "new_field" and item["field"] == "collected_at"
+    )
+    assert new_field["source_date_precision"] == "day"
+    assert new_field["date_precision"] == "month"
+    result = planner.confirm(BATCH, "REC-A", preview, "as_requested", note="检验（月）")
+    material_dir = store.material_dir(BATCH, result["material_id"])
+    manifest = read_json(material_dir / "manifest.json")
+    record_precision = next(iter(manifest["field_date_precision"]["labs"].values()))
+    assert record_precision["collected_at"] == {"source": "day", "public": "month"}
+    assert record_precision["subject_id"] == {"source": "none", "public": "none"}
+    material_trace = read_csv(material_dir / "material_trace.csv")
+    assert all(row["source_date_precision"] == "day" for row in material_trace)
+    assert all(row["public_date_precision"] == "month" for row in material_trace)
+    deliveries = DeliveryRegistry(store).deliveries(BATCH, "REC-A")
+    assert deliveries[0]["public_date_precision"] == "month"
+
+
+def test_two_pending_applications_reopen_confirm_cancel_then_upgrade_precision(setup):
+    """月精度检验与日精度就诊两份待审：重开后分别确认/取消，再把检验提升为日精度。"""
+    store, exporter, version, planner, trace = setup
+    planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["labs"], application_id="APP-LAB", date_precision="month",
+    ), save=True)
+    planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["visits"], application_id="APP-VIS",
+    ), save=True)
+    # 关闭重开：两份待审申请都从磁盘恢复，精度显式落盘。
+    planner = DisclosurePlanner(store)
+    assert {
+        item["application_id"]: PendingApplicationStore.entry_date_precision(item)
+        for item in PendingApplicationStore(store).list(BATCH, "REC-A")
+    } == {"APP-LAB": "month", "APP-VIS": "day"}
+    lab_preview = planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["labs"], application_id="APP-LAB", date_precision="month",
+    ), save=True)
+    result_lab = planner.confirm(BATCH, "REC-A", lab_preview, "as_requested", note="检验（月）")
+    assert result_lab["delivery_id"] == "D001"
+    assert all(
+        len(row["collected_at"]) == 7
+        for row in read_csv(store.material_dir(BATCH, result_lab["material_id"]) / "labs.csv")
+    )
+    # 第二份申请取消：不形成材料、不留交付。
+    vis_preview = planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["visits"], application_id="APP-VIS",
+    ), save=True)
+    cancelled = planner.confirm(BATCH, "REC-A", vis_preview, "cancel")
+    assert cancelled["cancelled"] is True
+    assert PendingApplicationStore(store).list(BATCH, "REC-A") == []
+    # 检验提升为日精度重新预览：来源仍为 day，公开精度升级 month -> day。
+    upgrade = planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["labs"], date_precision="day",
+    ))
+    fields = {item["field"]: item for item in _record(upgrade["plans"]["as_requested"], "labs")["fields"]}
+    assert fields["collected_at"]["source_date_precision"] == "day"
+    assert fields["collected_at"]["date_precision"] == "day"
+    assert fields["collected_at"]["precision_upgrade_from"] == "month"
+    assert fields["collected_at"]["newly_linkable"] is True
+    upgraded = planner.confirm(BATCH, "REC-A", upgrade, "as_requested", note="检验（日）")
+    # 历史月精度交付原样保留，不被新精度改写。
+    registry = DeliveryRegistry(store).deliveries(BATCH, "REC-A")
+    assert [item["delivery_id"] for item in registry] == ["D001", "D002"]
+    assert registry[0]["public_date_precision"] == "month"
+    assert registry[1]["public_date_precision"] == "day"
+    old_dir = store.material_dir(BATCH, registry[0]["material_id"])
+    assert all(len(row["collected_at"]) == 7 for row in read_csv(old_dir / "labs.csv"))
+    new_dir = store.material_dir(BATCH, upgraded["material_id"])
+    assert all(len(row["collected_at"]) == 10 for row in read_csv(new_dir / "labs.csv"))
+
+
+def test_forbid_combination_uses_same_precision_basis_everywhere(setup):
+    """组合限制不允许因读取历史交付/待审同伴/本次预览而得到相反判断。"""
+    store, exporter, version, planner, trace = setup
+    # 历史：月精度检验已交付（collected_at 为月）。
+    planner.confirm(
+        BATCH, "REC-A",
+        planner.preview(BATCH, "REC-A", _request(version, trace, ["labs"], date_precision="month")),
+        "as_requested", note="检验（月）",
+    )
+    DisclosurePolicy(store, BATCH).revise(
+        {"forbid_fields": [], "forbid_combinations": [
+            {"fields": ["collected_at", "visit_date"]}
+        ]},
+        note="禁止检验日期+就诊日期组合",
+    )
+    # 从历史交付材料读取 collected_at（月）+ 本次日精度就诊：组合成立，必须拦。
+    preview = planner.preview(BATCH, "REC-A", _request(version, trace, ["visits"]))
+    assert any(
+        item["kind"] == "forbid_combination"
+        for item in preview["plans"]["as_requested"]["blocked"]
+    )
+    # 同一接收者、无历史交付时，月精度检验作为**待审同伴**出现：判定必须一致。
+    RecipientStore(store).register(BATCH, "REC-B", name="另一家机构")
+    planner.preview(BATCH, "REC-B", _request(
+        version, trace, ["labs"], application_id="APP-LAB", date_precision="month",
+    ), save=True)
+    peer_preview = planner.preview(BATCH, "REC-B", _request(
+        version, trace, ["visits"], application_id="APP-VIS",
+    ), save=True)
+    assert any(
+        item["kind"] == "forbid_combination"
+        for item in peer_preview["plans"]["as_requested"]["blocked"]
+    )
+    # 月精度下两日期仍可关联：降精度方案也不能绕过，只有剔除字段才行。
+    assert any(
+        item["kind"] == "forbid_combination"
+        for item in peer_preview["plans"]["reduce_precision"]["blocked"]
+    )

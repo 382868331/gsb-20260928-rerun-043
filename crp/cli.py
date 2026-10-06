@@ -189,9 +189,15 @@ def cmd_disclosure_preview(args: argparse.Namespace) -> None:
     if args.output:
         Path(args.output).write_text(json.dumps(preview, ensure_ascii=False, indent=2) + "\n",
                                       encoding="utf-8")
+    as_requested_spec = preview["plans"]["as_requested"].get("material_spec")
+    requested_precision = preview.get(
+        "requested_date_precision",
+        as_requested_spec.get("date_precision") if as_requested_spec else "-",
+    )
     print(
         f"接收者 {args.recipient_id} 联合披露预览：绑定导出版本 v{preview['request_version']}，"
         f"授权 v{preview['authorization_revision']}，政策 v{preview['policy_revision']}，"
+        f"本次申请公开日期精度 {requested_precision}，"
         f"既有交付 {len(preview['prior_deliveries'])} 次，"
         f"同接收方待审申请 {len(preview['peer_pending'])} 份"
     )
@@ -256,7 +262,9 @@ def cmd_deliveries(args: argparse.Namespace) -> None:
     for item in deliveries:
         print(
             f"  {item['delivery_id']} 材料 {item['material_id']} 时间 {item['created_at']} "
-            f"授权v{item['authorization_revision']} 政策v{item['policy_revision']} {item['note']}"
+            f"授权v{item['authorization_revision']} 政策v{item['policy_revision']} "
+            f"公开日期精度 {item.get('public_date_precision', item.get('spec', {}).get('date_precision', 'day'))} "
+            f"{item['note']}"
         )
 
 

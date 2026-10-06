@@ -108,6 +108,14 @@ python -m crp deliveries STUDY-001 REC-A
   同一记录在新导出版本中再次出现、字段经过不同变换（如更细日期精度）都会如实列出；
 - **新增公开内容**：逐字段标注是否首次可被该接收者关联到（`newly_linkable`）、日期精度是否
   较既往升级，并汇总跨既有交付的 `new_combination`；
+  日期精度始终分列两级：`source_date_precision` 是冻结导出版本中**来源资料**的精度，
+  `date_precision` 是**本次实际公开**的精度（月精度申请中来源为 `day` 的字段公开为 `month`，
+  两者不会互相冒充）；非日期字段两者均显式为 `null`/`none`，表示「该字段不是日期字段」，
+  而不是缺省或未知。对外材料 `manifest.json` 的 `field_date_precision` 与
+  `material_trace.csv` 的 `source_date_precision`/`public_date_precision` 列、内部交付登记的
+  `public_date_precision` 使用同一口径；历史交付只按交付当时的材料值读取，后来的新精度不改写它；
+  禁止组合判定对「历史交付材料 / 其他待审申请 / 本次预览」三个读取位置使用同一公开精度口径，
+  不会因报告位置不同而得出相反判断；
 - **四种方案对比**：`as_requested`（全部，撞政策时确认被拦截）、`allow_only`（剔除授权外/政策禁止
   的字段或记录）、`reduce_precision`（日期降至月，重新计算仍成立的组合）、`cancel`（不形成材料），
   每种方案各自列出仍会新增的可关联内容与采用规则；

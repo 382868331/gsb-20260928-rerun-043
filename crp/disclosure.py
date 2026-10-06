@@ -23,6 +23,7 @@ from __future__ import annotations
 import csv
 import io
 import re
+import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +67,19 @@ def truncate_date(value: str, precision: str) -> str:
     if precision == "month":
         return f"{year}-{month or '01'}"
     return f"{year}-{month or '01'}-{day or '01'}"
+
+
+def public_date_precision(source_precision: str | None, cap: str) -> str | None:
+    """来源资料精度在本次公开上限下实际采用的公开精度。
+
+    非日期字段（``source_precision is None``）在任何方案下都不涉及日期精度，
+    明确返回 ``None`` 表示「该字段不是日期字段」，而不是缺省或未知。
+    """
+    if source_precision is None:
+        return None
+    if DATE_PRECISION_ORDER[source_precision] <= DATE_PRECISION_ORDER[cap]:
+        return source_precision
+    return cap
 
 
 class RecipientExistsError(FileExistsError):
@@ -397,6 +411,8 @@ class MaterialBuilder:
         for table, record_id in spec.records:
             wanted.setdefault(table, set()).add(record_id)
         files: dict[str, str] = {}
+        # 每张表逐字段记录「来源资料精度 / 本次公开精度」，非日期字段显式记为 "none"。
+        field_precision: dict[str, dict[str, dict[str, str]]] = {}
         for table in sorted(wanted):
             rows = read_csv(version_dir / f"{table}.csv")
             trace_rows = self._trace_index(version_dir, table)
@@ -410,6 +426,10 @@ class MaterialBuilder:
                 row = rows[int(trace["output_row"]) - 2]
                 if allowed_columns is not None:
                     row = {name: row.get(name, "") for name in allowed_columns}
+                precision_map = self._field_precision_map(row, spec.date_precision)
+                field_precision.setdefault(table, {}).setdefault(
+                    trace["record_id"], precision_map,
+                )
                 row = self._apply_precision(table, row, spec.date_precision, manifest)
                 selected.append(row)
             columns = self._columns(table, rows, spec, manifest)
@@ -421,7 +441,7 @@ class MaterialBuilder:
             trace_text += self._material_trace(table, [
                 trace for trace in self._trace_index(version_dir, table)
                 if trace["record_id"] in wanted[table]
-            ], spec)
+            ], spec, field_precision.get(table, {}))
         trace_path = target_dir / "material_trace.csv"
         # 去重：多来源时只保留一次表头。
         lines = trace_text.splitlines(keepends=True)
@@ -438,6 +458,12 @@ class MaterialBuilder:
             "spec": spec.to_dict(),
             "spec_fingerprint": spec.fingerprint(),
             "source_version": spec.version,
+            # 字段级精度说明：source 为冻结导出版本中的资料精度，public 为本次
+            # 实际公开精度；"none" 明确表示该字段不是日期字段（而非缺省/未知）。
+            "field_date_precision": {
+                table: {record_id: fields for record_id, fields in records.items()}
+                for table, records in sorted(field_precision.items())
+            },
             "files": dict(sorted(files.items())),
         }
         write_json(target_dir / "manifest.json", material_manifest)
@@ -477,14 +503,45 @@ class MaterialBuilder:
         return row
 
     @staticmethod
-    def _material_trace(table: str, trace_rows: list[dict[str, str]], spec: MaterialSpec) -> str:
+    def _field_precision_map(row: dict[str, str], public_cap: str) -> dict[str, dict[str, str]]:
+        result: dict[str, dict[str, str]] = {}
+        for name, value in row.items():
+            source_precision = date_precision_of(value)
+            result[name] = {
+                # 非日期字段明确为 "none"：该字段不含日期，不参与日期精度核对。
+                "source": source_precision or "none",
+                "public": public_date_precision(source_precision, public_cap) or "none",
+            }
+        return result
+
+    @staticmethod
+    def _material_trace(table: str, trace_rows: list[dict[str, str]], spec: MaterialSpec,
+                        field_precision_by_record: dict[str, dict[str, dict[str, str]]]) -> str:
         buffer = io.StringIO(newline="")
         writer = csv.writer(buffer, lineterminator="\n")
         writer.writerow([
             "table", "source_name", "record_id", "subject_id", "source_version",
-            "source_output_row", "date_precision", "source_alias",
+            "source_output_row", "source_date_precision", "public_date_precision",
+            "source_alias",
         ])
         for trace in trace_rows:
+            record_map = field_precision_by_record.get(trace["record_id"], {})
+            date_fields = {
+                name: precisions for name, precisions in record_map.items()
+                if precisions["source"] != "none"
+            }
+            if date_fields:
+                source_precision = max(
+                    (item["source"] for item in date_fields.values()),
+                    key=lambda value: DATE_PRECISION_ORDER[value],
+                )
+                public_precision = max(
+                    (item["public"] for item in date_fields.values()),
+                    key=lambda value: DATE_PRECISION_ORDER[value],
+                )
+            else:
+                # 记录没有任何日期字段：明确记为 none，与「未核对/缺省」区分。
+                source_precision = public_precision = "none"
             writer.writerow([
                 table,
                 spec.source_names.get(table, table),
@@ -492,7 +549,8 @@ class MaterialBuilder:
                 trace["subject_id"],
                 spec.version,
                 trace["output_row"],
-                spec.date_precision,
+                source_precision,
+                public_precision,
                 spec.source_aliases.get(table, ""),
             ])
         return buffer.getvalue()
@@ -592,6 +650,9 @@ class DeliveryRegistry:
             "audit_note": audit_note,
             "authorization_revision": authorization_revision,
             "policy_revision": policy_revision,
+            # 本次交付实际采用的日期公开精度；来源资料精度以材料
+            # manifest 的 field_date_precision 为准，历史记录永不改写。
+            "public_date_precision": spec.date_precision,
             "spec": spec.to_dict(),
             "new_disclosures": new_disclosures,
             "attempts": 1,
@@ -700,7 +761,18 @@ class RecordLink:
 
 @dataclass(frozen=True)
 class FieldDisclosure:
+    """单个字段在本次申请中的精度说明。
+
+    - ``source_date_precision``：字段在冻结导出版本（来源资料）中的日期精度；
+      非日期字段明确为 ``None``（``date_field=False``），表示「不是日期字段」，
+      而非缺省或未知；
+    - ``date_precision``：本次方案实际公开的日期精度（来源精度经申请上限/
+      降精度方案处理后的结果），非日期字段同样明确为 ``None``。
+    """
+
     field: str
+    date_field: bool
+    source_date_precision: str | None
     date_precision: str | None
     newly_linkable: bool
     precision_upgrade_from: str | None
@@ -738,6 +810,8 @@ class RecordPreview:
             "fields": [
                 {
                     "field": item.field,
+                    "date_field": item.date_field,
+                    "source_date_precision": item.source_date_precision,
                     "date_precision": item.date_precision,
                     "newly_linkable": item.newly_linkable,
                     "precision_upgrade_from": item.precision_upgrade_from,
@@ -836,6 +910,9 @@ class DisclosurePlanner:
             trace_path = material_dir / "material_trace.csv"
             if not trace_path.exists():
                 continue
+            material_manifest_path = material_dir / "manifest.json"
+            material_manifest = read_json(material_manifest_path) if material_manifest_path.exists() else {}
+            field_precision_index = material_manifest.get("field_date_precision", {})
             rows_by_source: dict[str, list[dict[str, str]]] = {}
             for trace in read_csv(trace_path):
                 source_name = trace.get("source_name") or trace["table"]
@@ -843,6 +920,20 @@ class DisclosurePlanner:
                 rows = rows_by_source.setdefault(source_name, read_csv(path) if path.exists() else [])
                 index = int(trace["source_output_row"]) - 2
                 row = rows[index] if 0 <= index < len(rows) else {}
+                # 实际公开精度以材料 CSV 的真实值为准（历史交付不被新精度改写）；
+                # 来源精度取自材料 manifest 的字段级说明，缺失时由公开值推断。
+                manifest_fields = field_precision_index.get(trace["table"], {}).get(
+                    trace["record_id"], {},
+                )
+                source_field_precision: dict[str, str | None] = {}
+                public_field_precision: dict[str, str | None] = {}
+                for field_name in row:
+                    entry = manifest_fields.get(field_name, {})
+                    source_value = entry.get("source") if entry else None
+                    source_field_precision[field_name] = (
+                        None if source_value in (None, "none") else source_value
+                    )
+                    public_field_precision[field_name] = date_precision_of(row.get(field_name, ""))
                 prior.append({
                     "delivery_id": delivery["delivery_id"],
                     "material_id": delivery["material_id"],
@@ -852,7 +943,11 @@ class DisclosurePlanner:
                     "pseudonym": trace["subject_id"],
                     "fields": set(row.keys()),
                     "values": dict(row),
-                    "date_precision": trace.get("date_precision", "day"),
+                    "source_field_date_precision": source_field_precision,
+                    "field_date_precision": public_field_precision,
+                    "source_date_precision": trace.get("source_date_precision") or "none",
+                    "date_precision": trace.get("public_date_precision")
+                    or trace.get("date_precision", "day"),
                     "status": "delivered",
                     "application_id": None,
                 })
@@ -894,6 +989,14 @@ class DisclosurePlanner:
                     "pseudonym": record["pseudonym"],
                     "fields": set(fields),
                     "values": values,
+                    # 与既有交付同一结构：来源资料精度与同伴申请实际公开精度分列。
+                    "source_field_date_precision": {
+                        name: date_precision_of(record["values"].get(name, ""))
+                        for name in fields
+                    },
+                    "field_date_precision": {
+                        name: date_precision_of(values.get(name, "")) for name in fields
+                    },
                     "date_precision": effective_precision,
                     "status": "pending",
                     "application_id": entry["application_id"],
@@ -1005,6 +1108,10 @@ class DisclosurePlanner:
                               note=str(request.get("note", "")))
         requested = self._requested_records(batch_id, request)
         prior = self._prior_records(batch_id, recipient_id)
+        # 申请声明的日期精度是本次公开精度的上限；来源资料自身的精度在字段级单独保留。
+        requested_cap = str(request.get("date_precision", "day"))
+        if requested_cap not in DATE_PRECISION_ORDER:
+            raise ValueError(f"未知日期精度: {requested_cap}")
         peers_day = self._peer_pending_records(
             batch_id, recipient_id,
             exclude_application_id=str(application_id) if application_id else None,
@@ -1031,31 +1138,36 @@ class DisclosurePlanner:
             record_history = self._record_field_history(links, prior)
             for field_name in record["fields"]:
                 value = record["values"].get(field_name, "")
-                precision = date_precision_of(value)
+                source_precision = date_precision_of(value)
                 prior_subject = subject_history.get(field_name)
                 prior_record = record_history.get(field_name)
                 first_by = (prior_record or prior_subject or {}).get("delivery_id") if (prior_record or prior_subject) else None
                 upgrade_from = None
-                if precision is not None and prior_subject is not None:
+                public_precision = public_date_precision(source_precision, requested_cap)
+                if public_precision is not None and prior_subject is not None:
                     prior_precision = prior_subject.get("precision") or "day"
-                    if DATE_PRECISION_ORDER[precision] > DATE_PRECISION_ORDER[prior_precision]:
+                    if DATE_PRECISION_ORDER[public_precision] > DATE_PRECISION_ORDER[prior_precision]:
                         upgrade_from = prior_precision
                 newly = prior_subject is None or upgrade_from is not None
                 preview.fields.append(FieldDisclosure(
                     field=field_name,
-                    date_precision=precision,
+                    date_field=source_precision is not None,
+                    source_date_precision=source_precision,
+                    date_precision=public_precision,
                     newly_linkable=newly,
                     precision_upgrade_from=upgrade_from,
                     first_delivered_by=first_by,
                 ))
-            preview.new_combinations = self._new_combinations(record, links, joint_day, "day")
+            preview.new_combinations = self._new_combinations(
+                record, links, joint_day, requested_cap,
+            )
             previews.append(preview)
 
         plans = {}
         for plan_name in ("as_requested", "allow_only", "reduce_precision", "cancel"):
             plans[plan_name] = self._evaluate_plan(
-                plan_name, previews, request, policy_rules, authorization,
-                policy_revision, prior, peers_day, batch_id, recipient_id,
+                plan_name, copy.deepcopy(previews), request, policy_rules, authorization,
+                policy_revision, prior, peers_day, joint_day, batch_id, recipient_id,
             ).to_dict()
 
         return {
@@ -1067,6 +1179,8 @@ class DisclosurePlanner:
             "authorization_revision": recipient.authorization_revision,
             "policy_revision": policy_revision,
             "request_version": int(request["version"]),
+            # 本次申请声明的公开精度上限；各字段来源资料精度在 fields 中逐项标注。
+            "requested_date_precision": requested_cap,
             "snapshot": snapshot,
             "peer_pending": [
                 {
@@ -1156,20 +1270,35 @@ class DisclosurePlanner:
                                    "source_name": record["source_name"]},
                 "prior_record": {"delivery_id": item["delivery_id"], "material_id": item["material_id"],
                                  "record_id": item["record_id"], "source_name": item["source_name"]},
-                "current_fields": self._fields_at_precision(record["fields"], record["values"], precision_cap),
+                # 字段是否参与组合只看「本次实际公开哪些字段」：日期字段即使被截断
+                # 到较粗精度仍然公开，逐字段标注来源精度与本次公开精度。
+                "current_fields": sorted(record["fields"]),
+                "current_field_precision": {
+                    name: {
+                        "source_date_precision": date_precision_of(record["values"].get(name, "")),
+                        "public_date_precision": public_date_precision(
+                            date_precision_of(record["values"].get(name, "")), precision_cap),
+                    }
+                    for name in record["fields"]
+                },
                 "prior_fields": sorted(item["fields"]),
+                "prior_date_precision": self._record_public_precision(item, precision_cap),
             })
         return combos
 
     @staticmethod
-    def _fields_at_precision(fields: list[str], values: dict[str, str], cap: str) -> list[str]:
-        result = []
-        for name in fields:
-            precision = date_precision_of(values.get(name, ""))
-            if precision is not None and DATE_PRECISION_ORDER[precision] > DATE_PRECISION_ORDER[cap]:
-                continue
-            result.append(name)
-        return sorted(result)
+    def _record_public_precision(item: dict[str, Any], cap: str) -> dict[str, str | None]:
+        """统一口径：从记录的**实际公开值**读取每个字段的日期精度。
+
+        历史交付读交付材料 CSV、待审同伴读按申请精度截断后的值、本次记录读
+        本次将公开的值——所有报告位置都通过同一函数得到「在当前方案精度下
+        是否可关联」的判断，避免一处读来源精度、一处读公开精度导致相反结论。
+        非日期字段明确为 ``None``（该字段不是日期字段）。
+        """
+        return {
+            name: public_date_precision(date_precision_of(item["values"].get(name, "")), cap)
+            for name in item["fields"]
+        }
 
     # ---- 方案评估 -----------------------------------------------------
 
@@ -1177,6 +1306,7 @@ class DisclosurePlanner:
                        request: dict[str, Any], policy_rules: dict[str, Any],
                        authorization: dict[str, Any], policy_revision: int,
                        prior: list[dict[str, Any]], peers_day: list[dict[str, Any]],
+                       joint_day: list[dict[str, Any]],
                        batch_id: str, recipient_id: str) -> PlanPreview:
         blocked: list[dict[str, Any]] = []
         included: list[RecordPreview] = []
@@ -1214,12 +1344,18 @@ class DisclosurePlanner:
                     "table": preview.table,
                     "record_id": preview.record_id,
                 })
+        # 既往受试者字段史（日精度口径）：降精度方案下用于重算升级/新增标注。
+        subject_histories = {
+            preview.pseudonym: self._subject_field_history(joint_day, preview.pseudonym)
+            for preview in previews
+        }
         for preview in previews:
             if not preview.authorized:
                 continue
             allowed_field_names: list[str] = []
             record_fields: list[FieldDisclosure] = []
-            for item in preview.fields:
+            history = subject_histories[preview.pseudonym]
+            for index, item in enumerate(preview.fields):
                 dropped_reason = None
                 if self._field_forbidden(item.field, preview.table, policy_rules):
                     dropped_reason = "forbid_field"
@@ -1240,29 +1376,48 @@ class DisclosurePlanner:
                     })
                 else:
                     allowed_field_names.append(item.field)
-                adjusted = item
-                if plan_name == "reduce_precision" and item.date_precision is not None \
-                        and DATE_PRECISION_ORDER[item.date_precision] > DATE_PRECISION_ORDER["month"]:
-                    adjusted = FieldDisclosure(
-                        field=item.field,
-                        date_precision="month",
-                        newly_linkable=False,
-                        precision_upgrade_from=None,
-                        first_delivered_by=item.first_delivered_by,
-                    )
+                # 方案精度（reduce_precision 为月）下重新计算本次实际公开精度，
+                # 来源资料精度始终保留在 source_date_precision，不被方案改写。
+                public_precision = public_date_precision(item.source_date_precision, precision_cap)
+                upgrade_from = None
+                if public_precision is not None and item.field in history:
+                    prior_precision = history[item.field].get("precision") or "day"
+                    if DATE_PRECISION_ORDER[public_precision] > DATE_PRECISION_ORDER[prior_precision]:
+                        upgrade_from = prior_precision
+                prior_seen = item.field in history
+                adjusted = FieldDisclosure(
+                    field=item.field,
+                    date_field=item.date_field,
+                    source_date_precision=item.source_date_precision,
+                    date_precision=public_precision,
+                    newly_linkable=(not prior_seen) or upgrade_from is not None,
+                    precision_upgrade_from=upgrade_from,
+                    first_delivered_by=item.first_delivered_by,
+                )
                 record_fields.append(adjusted)
             preview.fields = record_fields
+            # 方案精度变化（reduce_precision 降到月）时，组合中本次字段的公开精度
+            # 也按方案精度重列；字段集合不变（日期被截断但仍是公开字段）。
+            if precision_cap != str(request.get("date_precision", "day")):
+                preview.new_combinations = [
+                    {
+                        **combo,
+                        "current_field_precision": {
+                            name: {
+                                "source_date_precision": specs["source_date_precision"],
+                                "public_date_precision": public_date_precision(
+                                    specs["source_date_precision"], precision_cap,
+                                ),
+                            }
+                            for name, specs in combo.get("current_field_precision", {}).items()
+                        },
+                    }
+                    for combo in preview.new_combinations
+                ]
             include_fields.setdefault(preview.table, []).extend(
                 name for name in allowed_field_names
                 if name not in include_fields.get(preview.table, [])
             )
-            if plan_name == "reduce_precision":
-                # 降到月精度后，只有当月精度仍可与既往记录对齐的组合才算新增可关联内容。
-                date_field_names = {item.field for item in preview.fields if item.date_precision is not None}
-                preview.new_combinations = [
-                    combo for combo in preview.new_combinations
-                    if not (set(combo["current_fields"]) & date_field_names)
-                ]
             included.append(preview)
 
         # 受试者级联合组合判定：既有交付 + 同接收方其他待审申请 + 本申请纳入记录。
@@ -1314,8 +1469,12 @@ class DisclosurePlanner:
 
         对每位受试者分别汇总字段出处：组合在历史交付中已经成立的不拦（政策只管今后）；
         历史单独不成立、但合入待审申请与本次记录后才成立的组合为本次新增风险，
-        逐字段标注本次记录与所依赖的待审申请。日期字段在当前方案精度下被压低的，
-        该出处不计入，组合可能因此不成立。
+        逐字段标注本次记录与所依赖的待审申请。
+
+        三类出处（历史交付、待审同伴、本次记录）使用**同一口径**：字段在该出处的
+        实际公开精度（来源精度经各自方案上限处理后的结果）不细于当前方案精度即可
+        关联。读取方无论从交付材料、待审登记还是本次预览取值，结论必须一致；
+        非日期字段（公开精度为 ``None``）天然可关联，不存在「无精度即不公开」的歧义。
         """
         combos = policy_rules.get("forbid_combinations", [])
         if not combos or not included:
@@ -1328,6 +1487,12 @@ class DisclosurePlanner:
             sources = combo.get("sources")
             return not sources or table in sources
 
+        def _field_public(item: dict[str, Any], field_name: str) -> str | None:
+            """统一读取某出处记录中某字段在当前方案下的公开精度。"""
+            return public_date_precision(
+                date_precision_of(item["values"].get(field_name, "")), precision_cap,
+            )
+
         def _history_presence(subject: str, combo: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
             presence: dict[str, list[dict[str, str]]] = {}
             for item in prior:
@@ -1336,13 +1501,10 @@ class DisclosurePlanner:
                 for field_name in item["fields"]:
                     if field_name not in combo["fields"]:
                         continue
-                    precision = date_precision_of(item["values"].get(field_name, ""))
-                    if precision is not None \
-                            and DATE_PRECISION_ORDER[precision] > DATE_PRECISION_ORDER[precision_cap]:
-                        continue
                     presence.setdefault(field_name, []).append({
                         "table": item["table"], "record_id": item["record_id"],
                         "application_id": "",
+                        "public_date_precision": _field_public(item, field_name),
                     })
             return presence
 
@@ -1357,6 +1519,7 @@ class DisclosurePlanner:
                     presence.setdefault(field_name, []).append({
                         "table": item["table"], "record_id": item["record_id"],
                         "application_id": item["application_id"],
+                        "public_date_precision": _field_public(item, field_name),
                     })
             return presence
 
@@ -1377,12 +1540,10 @@ class DisclosurePlanner:
                     for field_item in preview.fields:
                         if field_item.field not in required:
                             continue
-                        if field_item.date_precision is not None \
-                                and DATE_PRECISION_ORDER[field_item.date_precision] > DATE_PRECISION_ORDER[precision_cap]:
-                            continue
                         current_presence.setdefault(field_item.field, []).append({
                             "table": preview.table, "record_id": preview.record_id,
                             "application_id": "",
+                            "public_date_precision": field_item.date_precision,
                         })
                 union_presence: dict[str, list[dict[str, str]]] = {}
                 for presence in (history_presence, peer_presence, current_presence):
@@ -1429,12 +1590,11 @@ class DisclosurePlanner:
                     "record_id": preview.record_id,
                     "pseudonym": preview.pseudonym,
                     "field": item.field,
-                    "date_precision": item.date_precision if precision_cap == "day" else (
-                        "month" if item.date_precision is not None and
-                        DATE_PRECISION_ORDER[item.date_precision] > DATE_PRECISION_ORDER["month"]
-                        else item.date_precision
-                    ),
-                    "precision_upgrade_from": None if precision_cap == "reduce_precision" else item.precision_upgrade_from,
+                    "date_field": item.date_field,
+                    # 来源资料精度与本次实际公开精度分列；非日期字段两者都显式为 null。
+                    "source_date_precision": item.source_date_precision,
+                    "date_precision": item.date_precision,
+                    "precision_upgrade_from": item.precision_upgrade_from,
                     "linkable_to": [
                         {"delivery_id": link.delivery_id, "record_id": link.record_id,
                          "source_name": link.source_name, "basis": link.basis}
@@ -1449,7 +1609,9 @@ class DisclosurePlanner:
                     "prior": combo["prior_record"],
                     "current_fields": combo["current_fields"],
                     "prior_fields": combo["prior_fields"],
-                    "date_precision": precision_cap,
+                    "current_field_precision": combo.get("current_field_precision", {}),
+                    "prior_date_precision": combo.get("prior_date_precision", {}),
+                    "public_date_precision": precision_cap,
                 })
             seen_subjects.add(preview.pseudonym)
         # 受试者级新增：同一伪名下本次出现的字段与既有来源组合。
