@@ -256,6 +256,7 @@ def cmd_deliveries(args: argparse.Namespace) -> None:
     for item in deliveries:
         print(
             f"  {item['delivery_id']} 材料 {item['material_id']} 时间 {item['created_at']} "
+            f"日期精度 {item.get('date_precision') or item.get('spec', {}).get('date_precision', 'day')} "
             f"授权v{item['authorization_revision']} 政策v{item['policy_revision']} {item['note']}"
         )
 

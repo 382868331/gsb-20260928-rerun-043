@@ -28,6 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import copy
+
 from crp.audit import PATTERN_CHECKS
 from crp.paths import Store
 from crp.util import read_csv, read_json, sha256_file, sha256_text, stable_json, write_csv, write_json
@@ -38,6 +40,11 @@ def _now() -> str:
 
 
 DATE_PRECISION_ORDER = {"year": 0, "month": 1, "day": 2}
+
+
+def precision_label(precision: str | None) -> str:
+    """报告中的精度标注：非日期字段显式标为 ``none``，不留含糊的空值。"""
+    return precision if precision is not None else "none"
 DATE_RE = re.compile(r"^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?")
 
 
@@ -435,6 +442,8 @@ class MaterialBuilder:
             "material_id": material_id,
             "batch_id": batch_id,
             "created_at": _now(),
+            # 本次实际公开精度在材料层显式落盘，与 material_trace 中的逐记录标注一致。
+            "date_precision": spec.date_precision,
             "spec": spec.to_dict(),
             "spec_fingerprint": spec.fingerprint(),
             "source_version": spec.version,
@@ -587,6 +596,8 @@ class DeliveryRegistry:
             "delivery_id": delivery_id,
             "created_at": _now(),
             "material_id": material_id,
+            # 交付历史显式记录本次实际公开精度；后续更细精度的新交付不回写此条目。
+            "date_precision": spec.date_precision,
             "note": note,
             # 审计说明仅保存在内部登记，绝不写入对外材料目录。
             "audit_note": audit_note,
@@ -700,11 +711,19 @@ class RecordLink:
 
 @dataclass(frozen=True)
 class FieldDisclosure:
+    """单个字段的披露标注。
+
+    - ``source_precision``：来源资料（冻结导出版本）中该值的日期精度；
+    - ``date_precision``：本次实际公开的日期精度（来源精度按申请上限压低后的结果）。
+      两者都是 ``None`` 表示该字段不是日期字段，报告中显式标注为 ``none``。
+    """
+
     field: str
     date_precision: str | None
     newly_linkable: bool
     precision_upgrade_from: str | None
     first_delivered_by: str | None
+    source_precision: str | None = None
 
 
 @dataclass
@@ -738,7 +757,8 @@ class RecordPreview:
             "fields": [
                 {
                     "field": item.field,
-                    "date_precision": item.date_precision,
+                    "date_precision": precision_label(item.date_precision),
+                    "source_precision": precision_label(item.source_precision),
                     "newly_linkable": item.newly_linkable,
                     "precision_upgrade_from": item.precision_upgrade_from,
                     "first_delivered_by": item.first_delivered_by,
@@ -994,6 +1014,10 @@ class DisclosurePlanner:
         application_id = request.get("application_id")
         if save and not application_id:
             raise ValueError("保存待审申请时必须提供 application_id")
+        # 本次申请声明的日期精度即实际公开精度的上限；未声明视为 "day"。
+        request_cap = str(request.get("date_precision", "day"))
+        if request_cap not in DATE_PRECISION_ORDER:
+            raise ValueError(f"未知日期精度: {request_cap}")
         # 快照口径与确认时一致：待审清单不包含本申请自身（本申请身份由
         # 待审登记与预览绑定核对，其变化不通过快照判定）。
         snapshot = self.snapshot(
@@ -1031,11 +1055,17 @@ class DisclosurePlanner:
             record_history = self._record_field_history(links, prior)
             for field_name in record["fields"]:
                 value = record["values"].get(field_name, "")
-                precision = date_precision_of(value)
                 prior_subject = subject_history.get(field_name)
                 prior_record = record_history.get(field_name)
                 first_by = (prior_record or prior_subject or {}).get("delivery_id") if (prior_record or prior_subject) else None
                 upgrade_from = None
+                # 来源精度按本申请实际上限压低后，才是本次真正公开的精度；
+                # 是否新增/升级都与既往实际交付精度比较，不看来源原始精度。
+                source_precision = date_precision_of(value)
+                precision = source_precision
+                if precision is not None and \
+                        DATE_PRECISION_ORDER[precision] > DATE_PRECISION_ORDER[request_cap]:
+                    precision = request_cap
                 if precision is not None and prior_subject is not None:
                     prior_precision = prior_subject.get("precision") or "day"
                     if DATE_PRECISION_ORDER[precision] > DATE_PRECISION_ORDER[prior_precision]:
@@ -1047,14 +1077,16 @@ class DisclosurePlanner:
                     newly_linkable=newly,
                     precision_upgrade_from=upgrade_from,
                     first_delivered_by=first_by,
+                    source_precision=source_precision,
                 ))
-            preview.new_combinations = self._new_combinations(record, links, joint_day, "day")
+            preview.new_combinations = self._new_combinations(record, links, joint_day, request_cap)
             previews.append(preview)
 
         plans = {}
         for plan_name in ("as_requested", "allow_only", "reduce_precision", "cancel"):
             plans[plan_name] = self._evaluate_plan(
-                plan_name, previews, request, policy_rules, authorization,
+                # 每个方案在独立副本上评估：降精度等调整不会污染其他方案的口径。
+                plan_name, copy.deepcopy(previews), request, policy_rules, authorization,
                 policy_revision, prior, peers_day, batch_id, recipient_id,
             ).to_dict()
 
@@ -1249,6 +1281,7 @@ class DisclosurePlanner:
                         newly_linkable=False,
                         precision_upgrade_from=None,
                         first_delivered_by=item.first_delivered_by,
+                        source_precision=item.source_precision,
                     )
                 record_fields.append(adjusted)
             preview.fields = record_fields
@@ -1256,13 +1289,6 @@ class DisclosurePlanner:
                 name for name in allowed_field_names
                 if name not in include_fields.get(preview.table, [])
             )
-            if plan_name == "reduce_precision":
-                # 降到月精度后，只有当月精度仍可与既往记录对齐的组合才算新增可关联内容。
-                date_field_names = {item.field for item in preview.fields if item.date_precision is not None}
-                preview.new_combinations = [
-                    combo for combo in preview.new_combinations
-                    if not (set(combo["current_fields"]) & date_field_names)
-                ]
             included.append(preview)
 
         # 受试者级联合组合判定：既有交付 + 同接收方其他待审申请 + 本申请纳入记录。
@@ -1429,12 +1455,10 @@ class DisclosurePlanner:
                     "record_id": preview.record_id,
                     "pseudonym": preview.pseudonym,
                     "field": item.field,
-                    "date_precision": item.date_precision if precision_cap == "day" else (
-                        "month" if item.date_precision is not None and
-                        DATE_PRECISION_ORDER[item.date_precision] > DATE_PRECISION_ORDER["month"]
-                        else item.date_precision
-                    ),
-                    "precision_upgrade_from": None if precision_cap == "reduce_precision" else item.precision_upgrade_from,
+                    # 字段级标注即本方案实际公开精度，与纳入记录中的口径一致。
+                    "date_precision": precision_label(item.date_precision),
+                    "source_precision": precision_label(item.source_precision),
+                    "precision_upgrade_from": item.precision_upgrade_from,
                     "linkable_to": [
                         {"delivery_id": link.delivery_id, "record_id": link.record_id,
                          "source_name": link.source_name, "basis": link.basis}
@@ -1524,6 +1548,7 @@ class DisclosurePlanner:
                 "recipient_id": recipient_id,
                 "delivery_id": entry["delivery_id"],
                 "material_id": material_id,
+                "date_precision": spec.date_precision,
                 "material_reused": True,
                 "delivery_reused": True,
                 "attempts": entry.get("attempts", 1),
@@ -1564,6 +1589,7 @@ class DisclosurePlanner:
             "recipient_id": recipient_id,
             "delivery_id": entry["delivery_id"],
             "material_id": result.material_id,
+            "date_precision": spec.date_precision,
             "material_reused": result.reused,
             "delivery_reused": entry.get("attempts", 1) > 1,
             "attempts": entry.get("attempts", 1),

@@ -407,3 +407,113 @@ def test_cancel_leaves_no_registration_and_recipients_are_isolated(setup):
         version, trace, ["medications"], application_id="APP-10",
     ), save=True)
     assert preview_b2["prior_deliveries"] == []
+
+
+def test_actual_precision_consistent_across_preview_material_and_history(setup):
+    store, exporter, version, planner, trace = setup
+    # 两份待审申请：月精度检验 + 日精度就诊，落盘后关闭重开。
+    planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["labs"], application_id="APP-L", date_precision="month",
+    ), save=True)
+    planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["visits"], application_id="APP-V",
+    ), save=True)
+    planner = DisclosurePlanner(store)
+    # 待审预览：记录级字段同时标注来源精度与本次实际公开精度，二者不再打架。
+    preview_l = planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["labs"], application_id="APP-L", date_precision="month",
+    ), save=True)
+    plan = preview_l["plans"]["as_requested"]
+    fields = {item["field"]: item for item in _record(plan, "labs")["fields"]}
+    assert fields["collected_at"]["source_precision"] == "day"
+    assert fields["collected_at"]["date_precision"] == "month"
+    # 非日期字段有明确含义，不是含糊的空值。
+    assert fields["test_code"]["date_precision"] == "none"
+    assert fields["test_code"]["source_precision"] == "none"
+    # 汇总位置与纳入记录位置读到的精度一致。
+    summary = next(
+        item for item in plan["new_disclosures"]
+        if item["kind"] == "new_field" and item["field"] == "collected_at"
+    )
+    assert summary["date_precision"] == "month"
+    assert summary["source_precision"] == "day"
+    # 确认检验（月精度），取消就诊：取消不留任何登记。
+    result_l = planner.confirm(BATCH, "REC-A", preview_l, "as_requested", note="检验（月）")
+    assert result_l["date_precision"] == "month"
+    preview_v = planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["visits"], application_id="APP-V",
+    ), save=True)
+    assert planner.confirm(BATCH, "REC-A", preview_v, "cancel")["cancelled"] is True
+    assert PendingApplicationStore(store).list(BATCH, "REC-A") == []
+    # 确认材料与交付历史都写明实际采用的月精度。
+    material_dir = store.material_dir(BATCH, result_l["material_id"])
+    assert read_json(material_dir / "manifest.json")["date_precision"] == "month"
+    trace_rows = read_csv(material_dir / "material_trace.csv")
+    assert {row["date_precision"] for row in trace_rows} == {"month"}
+    deliveries = DeliveryRegistry(store).deliveries(BATCH, "REC-A")
+    assert deliveries[0]["date_precision"] == "month"
+    # 检验提升为日精度重新预览：如实标注较既往实际交付精度（月）的升级。
+    upgrade = planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["labs"], date_precision="day",
+    ))
+    upgraded = {
+        item["field"]: item
+        for item in _record(upgrade["plans"]["as_requested"], "labs")["fields"]
+    }
+    assert upgraded["collected_at"]["date_precision"] == "day"
+    assert upgraded["collected_at"]["source_precision"] == "day"
+    assert upgraded["collected_at"]["precision_upgrade_from"] == "month"
+    assert upgraded["collected_at"]["newly_linkable"] is True
+    # 过去交付不被新精度改写：历史条目与旧材料保持月精度。
+    deliveries = DeliveryRegistry(store).deliveries(BATCH, "REC-A")
+    assert len(deliveries) == 1
+    assert deliveries[0]["date_precision"] == "month"
+    assert read_json(material_dir / "manifest.json")["date_precision"] == "month"
+    assert all(
+        len(row["collected_at"]) == 7 for row in read_csv(material_dir / "labs.csv")
+    )
+
+
+def test_combination_judgment_consistent_regardless_of_report_location(setup):
+    store, exporter, version, planner, trace = setup
+    # 检验先按月精度交付。
+    planner.confirm(
+        BATCH, "REC-A",
+        planner.preview(BATCH, "REC-A", _request(version, trace, ["labs"], date_precision="month")),
+        "as_requested", note="检验（月）",
+    )
+    DisclosurePolicy(store, BATCH).revise(
+        {"forbid_fields": [], "forbid_combinations": [
+            {"fields": ["collected_at", "visit_date"]}
+        ]},
+        note="禁止检验日期+就诊日期组合",
+    )
+    # 月精度检验 + 日精度就诊两份待审申请。
+    planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["labs"], application_id="APP-L", date_precision="month",
+    ), save=True)
+    planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["visits"], application_id="APP-V",
+    ), save=True)
+    preview_l = planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["labs"], application_id="APP-L", date_precision="month",
+    ), save=True)
+    preview_v = planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["visits"], application_id="APP-V",
+    ), save=True)
+    # 两份申请拼出同一组合：无论先读哪份申请、读哪个方案位置，判定一致。
+    for preview in (preview_l, preview_v):
+        for plan_name in ("as_requested", "reduce_precision"):
+            blocked = preview["plans"][plan_name]["blocked"]
+            assert any(b["kind"] == "forbid_combination" for b in blocked), plan_name
+    # 确认月精度检验（剔除检验日期）后，历史交付新增但判定不翻转：就诊依旧撞组合。
+    planner.confirm(BATCH, "REC-A", preview_l, "allow_only", note="检验（月，去日期）")
+    preview_v2 = planner.preview(BATCH, "REC-A", _request(
+        version, trace, ["visits"], application_id="APP-V",
+    ), save=True)
+    assert any(
+        b["kind"] == "forbid_combination"
+        for b in preview_v2["plans"]["as_requested"]["blocked"]
+    )
+    with pytest.raises(DisclosurePolicyError, match="forbid_combination"):
+        planner.confirm(BATCH, "REC-A", preview_v2, "as_requested")
